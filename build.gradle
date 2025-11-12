@@ -1,0 +1,61 @@
+import org.gradle.api.file.DuplicatesStrategy
+
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.7'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.cloudrangers'
+version = '0.0.1-SNAPSHOT'
+description = 'cloudpilot-worker'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter'
+    implementation 'org.springframework.boot:spring-boot-starter-amqp'   // RabbitMQ
+    implementation 'org.springframework.boot:spring-boot-starter-web'   // health check 등
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+    implementation 'me.paulschwarz:spring-dotenv:4.0.0'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+tasks.named("test") {
+    useJUnitPlatform()
+}
+
+/**
+ * 실제 main 클래스 (네가 보여준 그대로)
+ */
+springBoot {
+    mainClass = "com.cloudrangers.cloudpilotworker.CloudpilotWorkerApplication"
+}
+
+/**
+ * 모든 Jar/BootJar 중복 파일 전략: EXCLUDE
+ * (META-INF/MANIFEST.MF 중복 오류 해결)
+ */
+tasks.withType(Jar).configureEach {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named("bootJar") {
+    archiveFileName = "cloudpilot-worker.jar"
+}
+
+tasks.named("jar") {
+    enabled = false
+}
