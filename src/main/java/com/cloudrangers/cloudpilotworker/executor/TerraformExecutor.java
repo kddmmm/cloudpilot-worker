@@ -1,507 +1,707 @@
 package com.cloudrangers.cloudpilotworker.executor;
 
-import com.cloudrangers.cloudpilotworker.config.ProviderCredentials;
 import com.cloudrangers.cloudpilotworker.dto.ProvisionJobMessage;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.stereotype.Service;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-@Component
+/**
+ * Terraform 실행기
+ * - 실행 순서: init -> validate -> fmt(비치명적) -> plan/apply 또는 destroy
+ * - 모듈 스테이징: JAR 내장 모듈, Git 저장소, 로컬 디렉토리 모두 지원
+ */
+@Service
+@RequiredArgsConstructor
 @Slf4j
 public class TerraformExecutor {
 
-    @Value("${terraform.workspace:/tmp/terraform}")
-    private String terraformWorkspace;
+    private static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(30);
+    private static final String VARS_FILE_NAME = "terraform.auto.tfvars.json";
 
-    @Value("${terraform.timeout-minutes:10}")
-    private int timeoutMinutes;
+    // 내장 모듈 사용 여부 (JAR 내부 리소스)
+    @Value("${terraform.module.embedded:true}")
+    private boolean useEmbeddedModule;
 
-    @Value("${terraform.mock-mode:false}")
-    private boolean mockMode;
+    // 내장 모듈의 classpath 경로
+    @Value("${terraform.module.resource-path:/terraform/modules/vsphere-vm}")
+    private String moduleResourcePath;
 
-    private final ProviderCredentials providerCredentials;
-    private final ObjectMapper objectMapper;
+    // Git 모듈 소스 (예: git::https://...//vsphere-vm?ref=v1.2.3)
+    @Value("${terraform.module.source:}")
+    private String moduleSourceProp;
 
-    public TerraformExecutor(ProviderCredentials providerCredentials, ObjectMapper objectMapper) {
-        this.providerCredentials = providerCredentials;
-        this.objectMapper = objectMapper;
-    }
+    // 로컬 디렉토리 경로
+    @Value("${terraform.module.localDir:}")
+    private String moduleLocalDir;
 
-    public String execute(ProvisionJobMessage msg) throws Exception {
-        if (mockMode) {
-            log.info("(mock) terraform init/plan/apply - ws={}, jobId={}, vmName={}, cpu={}, mem={}GB, disk={}GB",
-                    terraformWorkspace, msg.getJobId(), msg.getVmName(),
-                    msg.getCpuCores(), msg.getMemoryGb(), msg.getDiskGb());
-            Thread.sleep(800);
-            return "vm-mock-" + msg.getVmName() + "-" + System.currentTimeMillis();
+    private final ResourceLoader resourceLoader;
+    private final ObjectMapper om = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
+
+    /**
+     * 기존 Listener 시그니처 호환: execute(ProvisionJobMessage msg)
+     */
+    public String execute(ProvisionJobMessage msg) {
+        Objects.requireNonNull(msg, "ProvisionJobMessage must not be null");
+
+        long jobId = parseJobId(safeInvoke(msg, "getJobId"));
+        String vmName = nvl((String) safeInvoke(msg, "getVmName"), "vm-" + jobId);
+        String action = resolveAction(msg);
+
+        // 작업 디렉토리
+        File workDir = new File("/tmp/terraform/" + jobId);
+        if (!workDir.exists() && !workDir.mkdirs()) {
+            throw new RuntimeException("Failed to create workDir: " + workDir.getAbsolutePath());
         }
 
-        log.info("Starting Terraform execution for jobId={}, vmName={}", msg.getJobId(), msg.getVmName());
-        Path jobWorkspace = Paths.get(terraformWorkspace, msg.getJobId());
-        Files.createDirectories(jobWorkspace);
+        // tfvars 구성
+        Map<String, Object> tfVars = buildTfVarsFromMessage(msg, vmName);
+
+        // 실행
+        execute(jobId, vmName, action, workDir, tfVars);
+
+        // 기존 시그니처가 String을 기대하므로 식별용으로 vmName 반환
+        return vmName;
+    }
+
+    /**
+     * (권장) 통합 실행 진입점.
+     */
+    public void execute(long jobId, String vmName, String action, File workDir, Map<String, Object> tfVars) {
+        Objects.requireNonNull(workDir, "workDir must not be null");
+        if (!workDir.exists() && !workDir.mkdirs()) {
+            throw new RuntimeException("Failed to create workDir: " + workDir);
+        }
+
+        log.info("Starting Terraform execution for jobId={}, vmName={}, action={}", jobId, vmName, action);
+
+        // 환경 변수
+        Map<String, String> env = new HashMap<>();
+        env.put("TF_IN_AUTOMATION", "1");
+
+        // 1) .tf 없으면 모듈 스테이징
+        ensureModulePresent(workDir, env);
+
+        // 2) vars 파일 쓰기
+        if (tfVars != null && !tfVars.isEmpty()) {
+            File vars = new File(workDir, VARS_FILE_NAME);
+            writeVarsFile(vars, tfVars);
+            log.info("Wrote vars file: {}", vars.getAbsolutePath());
+        } else {
+            log.debug("No tfvars content provided. Skipping vars file write.");
+        }
+
+        // 3) 실행 플로우
+        runTerraformSequence(workDir, env, action);
+    }
+
+    /**
+     * 간소화 오버로드
+     */
+    public void execute(File workDir, String action) {
+        Map<String, String> env = Map.of("TF_IN_AUTOMATION", "1");
+        ensureModulePresent(workDir, env);
+        runTerraformSequence(workDir, env, action);
+    }
+
+    // ===== 모듈 스테이징 (내장 모듈 우선) =====
+
+    private void ensureModulePresent(File dir, Map<String, String> env) {
+        log.debug("=== ensureModulePresent START ===");
+        log.debug("Working directory: {}", dir.getAbsolutePath());
+        log.debug("useEmbeddedModule: {}", useEmbeddedModule);
+        log.debug("moduleResourcePath: '{}'", moduleResourcePath);
+
+        if (hasTfFiles(dir)) {
+            log.info("✓ Terraform config already present in {}", dir.getAbsolutePath());
+            return;
+        }
+
+        log.info("No .tf files found. Starting module staging...");
+
+        // 우선순위 1: 내장 모듈 (JAR 내부)
+        if (useEmbeddedModule && isNotBlank(moduleResourcePath)) {
+            log.info("✓ Using embedded module from classpath: {}", moduleResourcePath);
+            try {
+                stageModuleFromClasspath(dir);
+                executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
+                log.info("✓ Embedded module staged successfully");
+                return;
+            } catch (Exception e) {
+                log.error("Failed to stage embedded module", e);
+                throw new RuntimeException("Failed to stage embedded module from classpath: " + moduleResourcePath, e);
+            }
+        }
+
+        // 우선순위 2: Git 모듈
+        String src = normalizeEmptyToNull(moduleSourceProp);
+        if (src == null) {
+            src = normalizeEmptyToNull(System.getenv("TERRAFORM_MODULE_SOURCE"));
+        }
+
+        log.debug("Resolved module source: '{}'", src);
+
+        if (src != null) {
+            log.info("✓ Using module source: {}", src);
+            stageModuleFromSource(dir, env, src);
+            return;
+        }
+
+        // 우선순위 3: 로컬 디렉토리
+        String localDir = normalizeEmptyToNull(moduleLocalDir);
+        log.debug("Checking local module directory: '{}'", localDir);
+
+        if (localDir != null) {
+            Path localPath = Path.of(localDir);
+            if (Files.exists(localPath) && Files.isDirectory(localPath)) {
+                log.info("✓ Using local module directory: {}", localDir);
+                stageModuleFromLocal(dir, env, localPath);
+                return;
+            } else {
+                log.warn("✗ Local module directory not found or not a directory: {}", localDir);
+            }
+        }
+
+        // 설정 없음
+        log.error("✗ No Terraform module source configured!");
+        log.error("   useEmbeddedModule: {}", useEmbeddedModule);
+        log.error("   moduleResourcePath: '{}'", moduleResourcePath);
+        log.error("   moduleSourceProp: '{}'", moduleSourceProp);
+        log.error("   TERRAFORM_MODULE_SOURCE env: '{}'", System.getenv("TERRAFORM_MODULE_SOURCE"));
+        log.error("   moduleLocalDir: '{}'", moduleLocalDir);
+
+        throw new RuntimeException(
+                "No Terraform configuration found and no module source configured.\n" +
+                        "╭─────────────────────────────────────────────────────────╮\n" +
+                        "│  해결 방법 (택 1):                                       │\n" +
+                        "│                                                         │\n" +
+                        "│  1. 내장 모듈 사용 (권장):                              │\n" +
+                        "│     src/main/resources/terraform/modules/vsphere-vm/    │\n" +
+                        "│     에 .tf 파일들을 배치하고                            │\n" +
+                        "│     application.properties 설정:                        │\n" +
+                        "│     terraform.module.embedded=true                      │\n" +
+                        "│     terraform.module.resource-path=                     │\n" +
+                        "│       /terraform/modules/vsphere-vm                     │\n" +
+                        "│                                                         │\n" +
+                        "│  2. Git 저장소 사용:                                    │\n" +
+                        "│     terraform.module.embedded=false                     │\n" +
+                        "│     terraform.module.source=                            │\n" +
+                        "│       git::https://github.com/...?ref=v1.0              │\n" +
+                        "│                                                         │\n" +
+                        "│  3. 로컬 디렉토리 사용:                                 │\n" +
+                        "│     terraform.module.embedded=false                     │\n" +
+                        "│     terraform.module.localDir=/path/to/modules          │\n" +
+                        "╰─────────────────────────────────────────────────────────╯");
+    }
+
+    /**
+     * classpath(JAR 내부)에서 Terraform 모듈 추출
+     */
+    private void stageModuleFromClasspath(File targetDir) throws IOException {
+        log.info("Extracting embedded Terraform module to {}", targetDir.getAbsolutePath());
+
+        PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
+        String pattern = "classpath:" + moduleResourcePath + "/**/*.tf";
+
+        log.debug("Scanning pattern: {}", pattern);
+        Resource[] resources = resolver.getResources(pattern);
+
+        if (resources == null || resources.length == 0) {
+            // .tf.json도 시도
+            pattern = "classpath:" + moduleResourcePath + "/**/*.tf.json";
+            resources = resolver.getResources(pattern);
+        }
+
+        if (resources == null || resources.length == 0) {
+            throw new IOException("No Terraform files found in classpath: " + moduleResourcePath);
+        }
+
+        log.info("Found {} Terraform file(s) in classpath", resources.length);
+
+        // 각 리소스를 대상 디렉토리로 복사
+        for (Resource resource : resources) {
+            String filename = resource.getFilename();
+            if (filename == null) continue;
+
+            File targetFile = new File(targetDir, filename);
+            log.debug("Copying {} to {}", filename, targetFile.getAbsolutePath());
+
+            try (InputStream is = resource.getInputStream();
+                 FileOutputStream fos = new FileOutputStream(targetFile)) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = is.read(buffer)) != -1) {
+                    fos.write(buffer, 0, bytesRead);
+                }
+            }
+        }
+
+        log.info("✓ Extracted {} Terraform files", resources.length);
+
+        if (!hasTfFiles(targetDir)) {
+            throw new IOException("Extraction completed but no .tf files found in " + targetDir);
+        }
+    }
+
+    /**
+     * Git 또는 레지스트리에서 모듈 스테이징
+     */
+    private void stageModuleFromSource(File dir, Map<String, String> env, String source) {
+        log.info("Staging module via 'terraform init -from-module={}'", source);
 
         try {
-            createTerraformFiles(jobWorkspace, msg);
-            executeCommand(jobWorkspace, "terraform", "init", "-input=false", "-no-color");
-            executeCommand(jobWorkspace, "terraform", "plan", "-out=tfplan", "-input=false", "-no-color");
-            executeCommand(jobWorkspace, "terraform", "apply", "-auto-approve", "tfplan");
+            // from-module로 초기 구성 가져오기
+            executeCommand(dir, env, "terraform", "init", "-from-module=" + source, "-input=false", "-no-color");
+            log.info("✓ Module staged from source");
 
-            String vmId = extractFirstOutput(jobWorkspace, "vm_ids");
-            if (vmId == null || vmId.isBlank()) {
-                // fallback: 이름 반환
-                vmId = extractFirstOutput(jobWorkspace, "vm_names");
-            }
-            if (vmId == null || vmId.isBlank()) {
-                throw new RuntimeException("No VM id/name found in Terraform outputs");
+            // provider 다운로드를 위한 추가 init
+            executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
+            log.info("✓ Providers initialized");
+
+            if (!hasTfFiles(dir)) {
+                throw new RuntimeException("Module staging completed but no .tf files found");
             }
 
-            log.info("Terraform execution completed successfully. jobId={}, vmId={}", msg.getJobId(), vmId);
-            return vmId;
+            log.info("✓ Module staging completed successfully");
 
         } catch (Exception e) {
-            log.error("Terraform execution failed for jobId={}: {}", msg.getJobId(), e.getMessage(), e);
-            throw new RuntimeException("Terraform execution failed: " + e.getMessage(), e);
+            throw new RuntimeException("Failed to stage module from source: " + source, e);
         }
     }
 
-    private void createTerraformFiles(Path workspace, ProvisionJobMessage msg) throws IOException {
-        // cloud-init user-data (Linux일 때만 생성)
-        if (!isWindows(msg)) {
-            String userData = renderCloudInit(msg);
-            Files.writeString(workspace.resolve("user-data.yml"), userData, StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    /**
+     * 로컬 디렉토리에서 모듈 복사
+     */
+    private void stageModuleFromLocal(File dir, Map<String, String> env, Path localPath) {
+        log.info("Staging module by copying from: {}", localPath);
+
+        try {
+            copyDirectoryRecursively(localPath, dir.toPath());
+            log.info("✓ Module files copied");
+
+            if (!hasTfFiles(dir)) {
+                throw new RuntimeException("Copied from local directory but no .tf files present");
+            }
+
+            // provider 다운로드
+            executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
+            log.info("✓ Providers initialized");
+
+            log.info("✓ Local module staging completed successfully");
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to stage module from local directory: " + localPath, e);
         }
-
-        Files.writeString(workspace.resolve("main.tf"), generateMainTf(msg), StandardCharsets.UTF_8);
-        Files.writeString(workspace.resolve("variables.tf"), generateVariablesTf(), StandardCharsets.UTF_8);
-        Files.writeString(workspace.resolve("terraform.tfvars"), generateTfvars(msg), StandardCharsets.UTF_8);
-        Files.writeString(workspace.resolve("outputs.tf"), generateOutputsTf(), StandardCharsets.UTF_8);
     }
 
-    private boolean isWindows(ProvisionJobMessage msg) {
-        return msg.getOs() != null
-                && msg.getOs().getFamily() != null
-                && msg.getOs().getFamily().toLowerCase(Locale.ROOT).contains("windows");
+    /**
+     * 빈 문자열을 null로 변환 (Spring의 빈 문자열 주입 처리)
+     */
+    private String normalizeEmptyToNull(String s) {
+        if (s == null || s.trim().isEmpty()) {
+            return null;
+        }
+        return s.trim();
     }
 
-    private String generateMainTf(ProvisionJobMessage msg) {
-        boolean dhcp = msg.getNet() == null
-                || msg.getNet().getMode() == null
-                || msg.getNet().getMode().equalsIgnoreCase("DHCP");
+    private boolean hasTfFiles(File dir) {
+        File[] list = dir.listFiles((d, name) -> name.endsWith(".tf") || name.endsWith(".tf.json"));
+        return list != null && list.length > 0;
+    }
 
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("""
-            terraform {
-              required_providers {
-                vsphere = {
-                  source  = "hashicorp/vsphere"
-                  version = "~> 2.5"
+    private void copyDirectoryRecursively(Path src, Path dst) {
+        try {
+            if (!Files.exists(dst)) Files.createDirectories(dst);
+            Files.walk(src).forEach(p -> {
+                try {
+                    Path rel = src.relativize(p);
+                    Path target = dst.resolve(rel);
+                    if (Files.isDirectory(p)) {
+                        if (!Files.exists(target)) Files.createDirectories(target);
+                    } else {
+                        Files.copy(p, target, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
                 }
-              }
-            }
-
-            provider "vsphere" {
-              user                 = var.vsphere_user
-              password             = var.vsphere_password
-              vsphere_server       = var.vsphere_server
-              allow_unverified_ssl = var.allow_unverified_ssl
-            }
-
-            data "vsphere_datacenter" "dc" {
-              name = var.datacenter
-            }
-
-            data "vsphere_compute_cluster" "cluster" {
-              name          = var.cluster
-              datacenter_id = data.vsphere_datacenter.dc.id
-            }
-
-            data "vsphere_datastore" "datastore" {
-              name          = var.datastore
-              datacenter_id = data.vsphere_datacenter.dc.id
-            }
-
-            data "vsphere_network" "network" {
-              name          = var.network
-              datacenter_id = data.vsphere_datacenter.dc.id
-            }
-            """);
-
-        // 템플릿 UUID 직접 제공 시 우선 사용, 없으면 name/moid로 resolve
-        sb.append("""
-            locals {
-              tpl_uuid = var.template_uuid != "" ? var.template_uuid : (
-                var.template_moid != "" ? data.vsphere_virtual_machine.tpl_moid.id : data.vsphere_virtual_machine.tpl_name.id
-              )
-            }
-
-            """);
-
-        sb.append("""
-            data "vsphere_virtual_machine" "tpl_name" {
-              count         = var.template_uuid == "" && var.template_moid == "" && var.template_item_name != "" ? 1 : 0
-              name          = var.template_item_name
-              datacenter_id = data.vsphere_datacenter.dc.id
-            }
-
-            data "vsphere_virtual_machine" "tpl_moid" {
-              count = var.template_uuid == "" && var.template_moid != "" ? 1 : 0
-              moid  = var.template_moid
-            }
-            """);
-
-        // VM 리소스
-        sb.append("\nresource \"vsphere_virtual_machine\" \"vm\" {\n");
-        sb.append("  count            = var.vm_count\n");
-        sb.append("  name             = \"${var.vm_name}-${count.index + 1}\"\n");
-        sb.append("  resource_pool_id = data.vsphere_compute_cluster.cluster.resource_pool_id\n");
-        sb.append("  datastore_id     = data.vsphere_datastore.datastore.id\n");
-        sb.append("  folder           = var.folder\n\n");
-
-        sb.append("  num_cpus = var.cpu_cores\n");
-        sb.append("  memory   = var.memory_gb * 1024\n");
-
-        // guest_id 힌트가 있으면 반영(없어도 템플릿에서 자동)
-        sb.append("  guest_id = var.guest_id != \"\" ? var.guest_id : null\n\n");
-
-        sb.append("  network_interface {\n");
-        sb.append("    network_id   = data.vsphere_network.network.id\n");
-        sb.append("    adapter_type = \"vmxnet3\"\n");
-        sb.append("  }\n\n");
-
-        // 디스크 사이즈 증설(템플릿 보다 클 때만 의미 있음)
-        sb.append("  disk {\n");
-        sb.append("    label            = \"disk0\"\n");
-        sb.append("    size             = var.disk_gb\n");
-        sb.append("    thin_provisioned = var.thin_provisioned\n");
-        sb.append("  }\n\n");
-
-        // clone 블록
-        sb.append("  clone {\n");
-        sb.append("    template_uuid = local.tpl_uuid\n");
-
-        if (isWindows(msg)) {
-            sb.append("    customize {\n");
-            sb.append("      windows_options {\n");
-            sb.append("        computer_name  = var.hostname\n");
-            sb.append("        time_zone      = var.win_time_zone\n");
-            sb.append("        admin_password = var.win_admin_password != \"\" ? var.win_admin_password : null\n");
-            sb.append("      }\n");
-            if (!dhcp) {
-                sb.append("      network_interface {\n");
-                sb.append("        ipv4_address = var.ipv4_address\n");
-                sb.append("        ipv4_netmask = var.ipv4_prefix\n");
-                sb.append("      }\n");
-                sb.append("      ipv4_gateway = var.ipv4_gateway\n");
-                sb.append("      dns_server_list = var.dns_servers\n");
-            }
-            sb.append("    }\n");
+            });
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to copy module directory: " + src + " -> " + dst, e);
         }
-        else {
-            // Linux는 DHCP면 네트워크 customize 생략
-            if (!dhcp) {
-                sb.append("    customize {\n");
-                sb.append("      linux_options {\n");
-                sb.append("        host_name = var.hostname\n");
-                sb.append("        domain    = var.domain\n");
-                sb.append("      }\n");
-                sb.append("      network_interface {\n");
-                sb.append("        ipv4_address = var.ipv4_address\n");
-                sb.append("        ipv4_netmask = var.ipv4_prefix\n");
-                sb.append("      }\n");
-                sb.append("      ipv4_gateway = var.ipv4_gateway\n");
-                sb.append("      dns_server_list = var.dns_servers\n");
-                sb.append("    }\n");
-            }
-        }
-        sb.append("  }\n\n");
-
-        // cloud-init user-data를 guestinfo로 전달 (Linux일 때만)
-        if (!isWindows(msg)) {
-            sb.append("""
-              extra_config = {
-                "guestinfo.userdata"          = base64encode(file("user-data.yml"))
-                "guestinfo.userdata.encoding" = "base64"
-              }
-
-              wait_for_guest_net_timeout = 10
-              wait_for_guest_ip_timeout  = 10
-              """);
-        }
-
-        sb.append("}\n");
-        return sb.toString();
     }
 
-    private String generateVariablesTf() {
-        return """
-            variable "vsphere_server" { type = string }
-            variable "vsphere_user"   { type = string }
-            variable "vsphere_password" { type = string, sensitive = true }
-            variable "allow_unverified_ssl" { type = bool, default = true }
+    // ===== 실행 시퀀스 =====
 
-            variable "datacenter" { type = string }
-            variable "cluster"    { type = string }
-            variable "datastore"  { type = string }
-            variable "network"    { type = string }
-            variable "folder"     { type = string, default = "/vm" }
+    private void runTerraformSequence(File dir, Map<String, String> env, String action) {
+        // 필수 단계
+        executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
+        executeCommand(dir, env, "terraform", "validate", "-no-color");
 
-            variable "vm_name"   { type = string }
-            variable "vm_count"  { type = number, default = 1 }
-            variable "cpu_cores" { type = number }
-            variable "memory_gb" { type = number }
-            variable "disk_gb"   { type = number }
-            variable "thin_provisioned" { type = bool, default = true }
+        // 포맷은 비치명적
+        executeCommandOrSkip(dir, env, false, "terraform", "fmt", "-recursive", "-write=true");
 
-            variable "template_uuid"      { type = string, default = "" }
-            variable "template_item_name" { type = string, default = "" }
-            variable "template_moid"      { type = string, default = "" }
-            variable "guest_id"           { type = string, default = "" }
-
-            # network/customize variables (STATIC일 때만 사용)
-            variable "hostname"    { type = string, default = null }
-            variable "domain"      { type = string, default = "local" }
-            variable "ipv4_address"{ type = string, default = null }
-            variable "ipv4_prefix" { type = number, default = null }
-            variable "ipv4_gateway"{ type = string, default = null }
-            variable "dns_servers" { type = list(string), default = [] }
-
-            # windows 전용
-            variable "win_admin_password" { type = string, default = "" }
-            variable "win_time_zone"      { type = number, default = 225 } # Asia/Seoul
-
-            """;
+        if ("apply".equalsIgnoreCase(action)) {
+            executeCommand(dir, env, "terraform", "plan", "-input=false", "-no-color", "-out=plan.tfplan");
+            executeCommand(dir, env, "terraform", "apply", "-input=false", "-no-color", "-auto-approve", "plan.tfplan");
+        } else if ("destroy".equalsIgnoreCase(action)) {
+            executeCommand(dir, env, "terraform", "plan", "-destroy", "-input=false", "-no-color", "-out=destroy.tfplan");
+            executeCommand(dir, env, "terraform", "apply", "-input=false", "-no-color", "-auto-approve", "destroy.tfplan");
+        } else {
+            executeCommand(dir, env, "terraform", "plan", "-input=false", "-no-color");
+        }
     }
 
-    private String generateTfvars(ProvisionJobMessage msg) {
-        String datacenter = pickStr(msg, "datacenter", providerCredentials.getDatacenter());
-        String cluster    = pickStr(msg, "cluster", providerCredentials.getCluster());
-        String datastore  = pickStr(msg, "datastore",
-                msg.getTemplate() != null && msg.getTemplate().getTemplateDatastore() != null
-                        ? msg.getTemplate().getTemplateDatastore()
-                        : providerCredentials.getDatastore());
-        String network    = pickStr(msg, "network", providerCredentials.getNetwork());
-        String folder     = pickStr(msg, "folder", providerCredentials.getFolder() == null ? "/vm" : providerCredentials.getFolder());
+    private void executeCommandOrSkip(File dir, Map<String, String> env, boolean failHard, String... cmd) {
+        try {
+            executeCommand(dir, env, cmd);
+        } catch (RuntimeException e) {
+            if (!failHard) {
+                log.warn("[Terraform][non-fatal] '{}' 실패(무시하고 계속 진행): {}",
+                        String.join(" ", cmd), firstLine(e.getMessage()));
+                return;
+            }
+            throw wrapTerraformException(e);
+        }
+    }
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("vsphere_server = \"").append(providerCredentials.getServer()).append("\"\n");
-        sb.append("vsphere_user   = \"").append(providerCredentials.getUser()).append("\"\n");
-        sb.append("vsphere_password = \"").append(providerCredentials.getPassword()).append("\"\n");
-        sb.append("allow_unverified_ssl = true\n\n");
+    private void executeCommand(File dir, Map<String, String> env, String... cmd) {
+        String display = String.join(" ", cmd);
+        log.info("Executing: {} (dir: {})", display, dir.getAbsolutePath());
 
-        sb.append("datacenter = \"").append(datacenter).append("\"\n");
-        sb.append("cluster    = \"").append(cluster).append("\"\n");
-        sb.append("datastore  = \"").append(datastore).append("\"\n");
-        sb.append("network    = \"").append(network).append("\"\n");
-        sb.append("folder     = \"").append(folder).append("\"\n\n");
+        ProcessBuilder pb = new ProcessBuilder(cmd)
+                .directory(dir)
+                .redirectErrorStream(false);
 
-        sb.append("vm_name   = \"").append(msg.getProperties() != null && msg.getProperties().getHostname() != null
-                ? msg.getProperties().getHostname() : msg.getVmName()).append("\"\n");
-        sb.append("vm_count  = ").append(msg.getVmCount() == null ? 1 : msg.getVmCount()).append("\n");
-        sb.append("cpu_cores = ").append(msg.getCpuCores()).append("\n");
-        sb.append("memory_gb = ").append(msg.getMemoryGb()).append("\n");
-        sb.append("disk_gb   = ").append(msg.getDiskGb()).append("\n");
-        sb.append("thin_provisioned = true\n\n");
+        if (env != null && !env.isEmpty()) pb.environment().putAll(env);
 
-        // template resolve
-        String tplUuid = (msg.getTemplate() != null && msg.getTemplate().getUuid() != null) ? msg.getTemplate().getUuid() : "";
-        String tplName = (msg.getTemplate() != null && msg.getTemplate().getItemName() != null) ? msg.getTemplate().getItemName() : "";
-        String tplMoid = (msg.getTemplate() != null && msg.getTemplate().getTemplateMoid() != null) ? msg.getTemplate().getTemplateMoid() : "";
-        String guestId = (msg.getTemplate() != null && msg.getTemplate().getGuestId() != null) ? msg.getTemplate().getGuestId() : "";
+        try {
+            Process p = pb.start();
 
-        sb.append("template_uuid      = \"").append(tplUuid).append("\"\n");
-        sb.append("template_item_name = \"").append(tplName).append("\"\n");
-        sb.append("template_moid      = \"").append(tplMoid).append("\"\n");
-        sb.append("guest_id           = \"").append(guestId).append("\"\n\n");
+            StringBuilder stdoutBuf = new StringBuilder();
+            StringBuilder stderrBuf = new StringBuilder();
+            CountDownLatch latch = new CountDownLatch(2);
 
-        // network/customize vars (STATIC만)
-        boolean dhcp = msg.getNet() == null || msg.getNet().getMode() == null || msg.getNet().getMode().equalsIgnoreCase("DHCP");
-        sb.append("hostname = \"").append(msg.getProperties() != null && msg.getProperties().getHostname() != null
-                ? msg.getProperties().getHostname() : msg.getVmName()).append("\"\n");
-        if (!dhcp && msg.getNet().getIpv4() != null) {
-            sb.append("ipv4_address = \"").append(nullSafe(msg.getNet().getIpv4().getAddress())).append("\"\n");
-            Integer prefix = msg.getNet().getIpv4().getPrefix();
-            sb.append("ipv4_prefix  = ").append(prefix == null ? "null" : prefix.toString()).append("\n");
-            sb.append("ipv4_gateway = \"").append(nullSafe(msg.getNet().getIpv4().getGateway())).append("\"\n");
-            if (msg.getNet().getDns() != null && !msg.getNet().getDns().isEmpty()) {
-                sb.append("dns_servers  = [");
-                for (int i = 0; i < msg.getNet().getDns().size(); i++) {
-                    if (i > 0) sb.append(", ");
-                    sb.append("\"").append(msg.getNet().getDns().get(i)).append("\"");
+            Thread tOut = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        stdoutBuf.append(line).append('\n');
+                        log.info("[terraform] {}", line);
+                    }
+                } catch (IOException ignore) {
+                } finally {
+                    latch.countDown();
                 }
-                sb.append("]\n");
+            }, "tf-stdout");
+
+            Thread tErr = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        stderrBuf.append(line).append('\n');
+                        log.error("[terraform] {}", line);
+                    }
+                } catch (IOException ignore) {
+                } finally {
+                    latch.countDown();
+                }
+            }, "tf-stderr");
+
+            tOut.start();
+            tErr.start();
+
+            boolean finished = p.waitFor(DEFAULT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                throw new RuntimeException("Command timed out: " + display);
             }
-        } else {
-            sb.append("ipv4_address = null\nipv4_prefix = null\nipv4_gateway = null\n");
-            sb.append("dns_servers = []\n");
-        }
-        sb.append("\n");
 
-        // windows vars
-        if (isWindows(msg) && msg.getProperties() != null && msg.getProperties().getWin() != null) {
-            String pw = msg.getProperties().getWin().getAdmin_password();
-            sb.append("win_admin_password = \"").append(pw == null ? "" : pw).append("\"\n");
-        } else {
-            sb.append("win_admin_password = \"\"\n");
-        }
+            latch.await(5, TimeUnit.SECONDS);
 
-        return sb.toString();
+            int exit = p.exitValue();
+            if (exit != 0) {
+                String merged = mergeOutErr(stdoutBuf.toString(), stderrBuf.toString());
+                throw wrapTerraformException(new RuntimeException(
+                        "Command failed: " + display + " (exit " + exit + ")\n" + merged));
+            }
+        } catch (IOException | InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw wrapTerraformException(new RuntimeException("Command failed to start/run: " + display, e));
+        }
     }
 
-    private String generateOutputsTf() {
-        return """
-            output "vm_ids" {
-              description = "IDs of created VMs"
-              value       = vsphere_virtual_machine.vm[*].id
-            }
-
-            output "vm_names" {
-              description = "Names of created VMs"
-              value       = vsphere_virtual_machine.vm[*].name
-            }
-
-            output "vm_ip_addresses" {
-              description = "IP addresses of created VMs"
-              value       = vsphere_virtual_machine.vm[*].default_ip_address
-            }
-            """;
+    private void writeVarsFile(File file, Map<String, Object> vars) {
+        try (FileOutputStream fos = new FileOutputStream(file);
+             OutputStreamWriter osw = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
+            om.writeValue(osw, vars);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write tfvars file: " + file.getAbsolutePath(), e);
+        }
     }
 
-    private String renderCloudInit(ProvisionJobMessage msg) {
-        // 아주 기본적인 cloud-init user-data 생성 (DHCP 전제)
-        String hostname = (msg.getProperties() != null && msg.getProperties().getHostname() != null)
-                ? msg.getProperties().getHostname() : msg.getVmName();
-        String timezone = (msg.getProperties() != null && msg.getProperties().getTimezone() != null)
-                ? msg.getProperties().getTimezone() : "Asia/Seoul";
+    // ===== 메시지 → tfvars 매핑 =====
 
-        StringBuilder y = new StringBuilder();
-        y.append("#cloud-config\n");
-        y.append("hostname: ").append(hostname).append("\n");
-        y.append("timezone: ").append(timezone).append("\n");
-        y.append("package_update: true\n");
+    private Map<String, Object> buildTfVarsFromMessage(ProvisionJobMessage msg, String vmName) {
+        Map<String, Object> tf = new LinkedHashMap<>();
 
-        // users
-        if (msg.getProperties() != null && msg.getProperties().getUsers() != null && !msg.getProperties().getUsers().isEmpty()) {
-            y.append("users:\n");
-            for (var u : msg.getProperties().getUsers()) {
-                y.append("  - name: ").append(u.getName()).append("\n");
-                if (u.getSudo() != null) y.append("    sudo: \"").append(u.getSudo()).append("\"\n");
-                if (u.getShell() != null) y.append("    shell: ").append(u.getShell()).append("\n");
-                if (u.getSsh_authorized_keys() != null && !u.getSsh_authorized_keys().isEmpty()) {
-                    y.append("    ssh_authorized_keys:\n");
-                    for (String k : u.getSsh_authorized_keys()) {
-                        y.append("      - ").append(k).append("\n");
+        // === vSphere 연결 정보 (환경 변수에서) ===
+        tf.put("vsphere_server", nvl(System.getenv("VSPHERE_SERVER"), "vcenter.example.com"));
+        tf.put("vsphere_user", nvl(System.getenv("VSPHERE_USER"), "administrator@vsphere.local"));
+        tf.put("vsphere_password", nvl(System.getenv("VSPHERE_PASSWORD"), ""));
+        tf.put("allow_unverified_ssl", Boolean.parseBoolean(nvl(System.getenv("VSPHERE_ALLOW_UNVERIFIED_SSL"), "true")));
+
+        // === vSphere 리소스 위치 ===
+        // 메시지에서 가져오거나 환경 변수 fallback
+        Object datacenterObj = safeInvoke(msg, "getDatacenter");
+        tf.put("datacenter", nvl(
+                datacenterObj != null ? String.valueOf(datacenterObj) : null,
+                nvl(System.getenv("VSPHERE_DATACENTER"), "ce5-3")
+        ));
+
+        Object clusterObj = safeInvoke(msg, "getCluster");
+        tf.put("cluster", nvl(
+                clusterObj != null ? String.valueOf(clusterObj) : null,
+                nvl(System.getenv("VSPHERE_CLUSTER"), "")
+        ));
+
+        Object datastoreObj = safeInvoke(msg, "getDatastore");
+        tf.put("datastore", nvl(
+                datastoreObj != null ? String.valueOf(datastoreObj) : null,
+                nvl(System.getenv("VSPHERE_DATASTORE"), "HDD1 (1)")
+        ));
+
+        Object networkObj = safeInvoke(msg, "getNetwork");
+        tf.put("network", nvl(
+                networkObj != null ? String.valueOf(networkObj) : null,
+                nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN")
+        ));
+
+        Object folderObj = safeInvoke(msg, "getFolder");
+        tf.put("folder", nvl(
+                folderObj != null ? String.valueOf(folderObj) : null,
+                ""
+        ));
+
+        // === VM 설정 ===
+        tf.put("vm_name", vmName);
+        tf.put("vm_count", safe((Number) safeInvoke(msg, "getVmCount"), 1));
+
+        // Template 이름
+        Object addCfg = safeInvoke(msg, "getAdditionalConfig");
+        Map<String, Object> add = (addCfg instanceof Map) ? (Map<String, Object>) addCfg : Collections.emptyMap();
+
+        String templateName = asString(add.get("templateName"));
+        if (!isNotBlank(templateName)) {
+            // additionalConfig에 없으면 template.itemName에서 가져오기
+            Object templateObj = safeInvoke(msg, "getTemplate");
+            if (templateObj != null) {
+                templateName = reflectString(templateObj, "getItemName");
+            }
+        }
+        tf.put("template_name", nvl(templateName, "ubuntu-22.04-gold"));
+
+        // 리소스 스펙
+        tf.put("cpu_cores", safe((Number) safeInvoke(msg, "getCpuCores"), 2));
+        tf.put("memory_gb", safe((Number) safeInvoke(msg, "getMemoryGb"), 4));
+        tf.put("disk_gb", safe((Number) safeInvoke(msg, "getDiskGb"), 50));
+
+        // 디스크 프로비저닝
+        String diskProv = asString(add.getOrDefault("diskProvisioning", "thin"));
+        tf.put("disk_provisioning", diskProv.toLowerCase()); // thin, thick, thick_eager
+
+        // === 네트워크 설정 ===
+        String ipMode = asString(add.getOrDefault("ipAllocationMode", "DHCP"));
+        tf.put("ip_allocation_mode", ipMode.toUpperCase()); // DHCP or STATIC
+
+        // net 객체에서 IP 정보 가져오기
+        Object netObj = safeInvoke(msg, "getNet");
+        if (netObj != null) {
+            Object ipv4Obj = safeInvoke(netObj, "getIpv4");
+            if (ipv4Obj != null) {
+                String ipv4 = reflectString(ipv4Obj, "getAddress", "getIp");
+                if (isNotBlank(ipv4)) {
+                    tf.put("ipv4_address", ipv4);
+
+                    Number netmask = (Number) safeInvoke(ipv4Obj, "getNetmask");
+                    if (netmask != null) {
+                        tf.put("ipv4_netmask", netmask.intValue());
+                    }
+
+                    String gateway = reflectString(ipv4Obj, "getGateway");
+                    if (isNotBlank(gateway)) {
+                        tf.put("ipv4_gateway", gateway);
                     }
                 }
             }
-        }
 
-        // packages
-        if (msg.getProperties() != null && msg.getProperties().getPackages() != null && !msg.getProperties().getPackages().isEmpty()) {
-            y.append("packages:\n");
-            for (String p : msg.getProperties().getPackages()) {
-                y.append("  - ").append(p).append("\n");
-            }
-        }
-
-        // files
-        if (msg.getProperties() != null && msg.getProperties().getFiles() != null && !msg.getProperties().getFiles().isEmpty()) {
-            y.append("write_files:\n");
-            for (var f : msg.getProperties().getFiles()) {
-                y.append("  - path: ").append(f.getPath()).append("\n");
-                if (f.getOwner() != null) y.append("    owner: ").append(f.getOwner()).append("\n");
-                if (f.getPerm() != null)  y.append("    permissions: \"").append(f.getPerm()).append("\"\n");
-                y.append("    content: |\n");
-                for (String line : (f.getContent() == null ? "" : f.getContent()).split("\\R")) {
-                    y.append("      ").append(line).append("\n");
+            // DNS 서버
+            Object dnsObj = safeInvoke(netObj, "getDns");
+            if (dnsObj != null && dnsObj instanceof List) {
+                List<?> dnsList = (List<?>) dnsObj;
+                if (!dnsList.isEmpty()) {
+                    List<String> dnsServers = new ArrayList<>();
+                    for (Object dns : dnsList) {
+                        dnsServers.add(String.valueOf(dns));
+                    }
+                    tf.put("dns_servers", dnsServers);
                 }
             }
         }
 
-        // runcmd
-        if (msg.getProperties() != null && msg.getProperties().getRuncmd() != null && !msg.getProperties().getRuncmd().isEmpty()) {
-            y.append("runcmd:\n");
-            for (String c : msg.getProperties().getRuncmd()) {
-                y.append("  - ").append(c).append("\n");
-            }
+        // Domain
+        tf.put("domain", "local");
+
+        // === Tags ===
+        Object tagsObj = safeInvoke(msg, "getTags");
+        if (tagsObj instanceof Map) {
+            tf.put("tags", tagsObj);
+        } else {
+            tf.put("tags", Collections.emptyMap());
         }
-        return y.toString();
+
+        return tf;
     }
 
-    private void executeCommand(Path workspace, String... command) throws Exception {
-        ProcessBuilder pb = new ProcessBuilder(command);
-        pb.directory(workspace.toFile());
-        pb.environment().putAll(System.getenv());
+    // ===== action 유추 =====
 
-        log.info("Executing: {} (dir: {})", String.join(" ", command), workspace);
-        Process process = pb.start();
+    private String resolveAction(Object msg) {
+        String fromGetter = reflectString(msg, "getAction", "getOperation", "getOp", "getCommand", "getMode");
+        if (isNotBlank(fromGetter)) return fromGetter;
 
-        Thread out = new Thread(() -> {
-            try (BufferedReader r = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = r.readLine()) != null) log.info("[{}] {}", command[0], line);
-            } catch (IOException ignored) {}
-        });
-        Thread err = new Thread(() -> {
-            try (BufferedReader r = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
-                String line;
-                while ((line = r.readLine()) != null) log.error("[{}] {}", command[0], line);
-            } catch (IOException ignored) {}
-        });
-        out.start(); err.start();
+        String fromField = reflectFieldString(msg, "action", "operation", "mode");
+        if (isNotBlank(fromField)) return fromField;
 
-        boolean completed = process.waitFor(timeoutMinutes, TimeUnit.MINUTES);
-        if (!completed) {
-            process.destroyForcibly();
-            throw new RuntimeException("Command timed out after " + timeoutMinutes + " minutes");
+        Object req = safeInvoke(msg, "getRequest");
+        String fromReq = reflectString(req, "getAction", "getOperation", "getOp", "getCommand", "getMode");
+        if (isNotBlank(fromReq)) return fromReq;
+
+        return "apply";
+    }
+
+    // ===== 에러 힌트 =====
+
+    private RuntimeException wrapTerraformException(RuntimeException e) {
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        StringBuilder hint = new StringBuilder();
+
+        if (msg.contains("Invalid single-argument block definition")) {
+            hint.append("\n\n[힌트] Terraform 변수 블록은 한 줄에 하나의 속성만 둘 수 없습니다.")
+                    .append("\n예) ❌  variable \"x\" { type = string, default = \"\" }")
+                    .append("\n    ✅  variable \"x\" {")
+                    .append("\n          type    = string")
+                    .append("\n          default = \"\"")
+                    .append("\n        }");
         }
-        out.join(); err.join();
 
-        if (process.exitValue() != 0) {
-            throw new RuntimeException("Command failed: " + String.join(" ", command) + " (exit " + process.exitValue() + ")");
+        if (msg.toLowerCase(Locale.ROOT).contains("no configuration files")) {
+            hint.append("\n\n[원인] 작업 디렉토리에 .tf 구성 파일이 없습니다.")
+                    .append("\n[조치] 아래 중 하나 설정:")
+                    .append("\n  - application.properties: terraform.module.embedded=true")
+                    .append("\n  - 또는 terraform.module.source: git::https://...//vsphere-vm?ref=v1.2.3")
+                    .append("\n  - 또는 terraform.module.localDir: /path/to/modules (해당 경로에 *.tf 존재)");
+        }
+
+        String wrapped = msg + hint;
+        return new RuntimeException(wrapped, e);
+    }
+
+    // ===== 리플렉션/유틸 =====
+
+    private Object safeInvoke(Object target, String method) {
+        if (target == null) return null;
+        try {
+            Method m = target.getClass().getMethod(method);
+            return m.invoke(target);
+        } catch (Exception ignore) {
+            return null;
         }
     }
 
-    private String extractFirstOutput(Path workspace, String key) throws Exception {
-        ProcessBuilder pb = new ProcessBuilder("terraform", "output", "-json", key);
-        pb.directory(workspace.toFile());
-
-        Process process = pb.start();
-        StringBuilder output = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            String line; while ((line = reader.readLine()) != null) output.append(line);
-        }
-        process.waitFor();
-
-        if (process.exitValue() != 0) return null;
-
-        // terraform -json 값은 {"sensitive":false,"type":["list","string"],"value":[...]}
-        Map<String, Object> node = objectMapper.readValue(output.toString(), new TypeReference<Map<String,Object>>(){});
-        Object val = node.get("value");
-        if (val instanceof List<?> list && !list.isEmpty()) {
-            Object first = list.get(0);
-            return first == null ? null : String.valueOf(first);
+    private String reflectString(Object target, String... methods) {
+        if (target == null) return null;
+        for (String m : methods) {
+            try {
+                Method mm = target.getClass().getMethod(m);
+                Object v = mm.invoke(target);
+                if (v != null) return String.valueOf(v);
+            } catch (Exception ignore) { }
         }
         return null;
     }
-    private String pickStr(ProvisionJobMessage msg, String key, String def) {
-        if (msg.getAdditionalConfig() != null && msg.getAdditionalConfig().get(key) != null) {
-            return String.valueOf(msg.getAdditionalConfig().get(key));
+
+    private String reflectFieldString(Object target, String... fields) {
+        if (target == null) return null;
+        for (String f : fields) {
+            try {
+                Field field = target.getClass().getDeclaredField(f);
+                field.setAccessible(true);
+                Object v = field.get(target);
+                if (v != null) return String.valueOf(v);
+            } catch (Exception ignore) { }
         }
-        return def;
+        return null;
     }
 
-    private String nullSafe(String s) { return s == null ? "" : s; }
+    private long parseJobId(Object v) {
+        if (v == null) return System.currentTimeMillis();
+        try {
+            if (v instanceof Number) return ((Number) v).longValue();
+            return Long.parseLong(String.valueOf(v));
+        } catch (Exception e) {
+            return System.currentTimeMillis();
+        }
+    }
+
+    private String nvl(String s, String def) {
+        return (s == null || s.isBlank()) ? def : s;
+    }
+
+    private boolean isNotBlank(String s) {
+        return s != null && !s.isBlank();
+    }
+
+    private int safe(Number v, int def) {
+        return v == null ? def : v.intValue();
+    }
+
+    private String asString(Object v) {
+        return v == null ? null : String.valueOf(v);
+    }
+
+    private void putIfAbsent(Map<String, Object> m, String k, Object v) {
+        if (!m.containsKey(k)) m.put(k, v);
+    }
+
+    private String firstLine(String s) {
+        if (s == null) return "";
+        int i = s.indexOf('\n');
+        return i >= 0 ? s.substring(0, i) : s;
+    }
+
+    private String mergeOutErr(String out, String err) {
+        if ((out == null || out.isBlank()) && (err == null || err.isBlank())) return "";
+        StringBuilder sb = new StringBuilder("╷\n");
+        if (out != null && !out.isBlank()) {
+            sb.append("┌─ stdout ─────────────────────────────\n").append(out);
+        }
+        if (err != null && !err.isBlank()) {
+            sb.append("└─ stderr ─────────────────────────────\n").append(err);
+        }
+        return sb.toString();
+    }
 }
