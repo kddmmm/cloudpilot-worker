@@ -1,10 +1,11 @@
 package com.cloudrangers.cloudpilotworker.executor;
 
 import com.cloudrangers.cloudpilotworker.dto.ProvisionJobMessage;
+import com.cloudrangers.cloudpilotworker.dto.ProvisionResultMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
@@ -17,71 +18,82 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Duration;
+import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-/**
- * Terraform 실행기
- * - 실행 순서: init -> validate -> fmt(비치명적) -> plan/apply 또는 destroy
- * - 모듈 스테이징: JAR 내장 모듈, Git 저장소, 로컬 디렉토리 모두 지원
- */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class TerraformExecutor {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(30);
     private static final String VARS_FILE_NAME = "terraform.auto.tfvars.json";
 
-    // 내장 모듈 사용 여부 (JAR 내부 리소스)
     @Value("${terraform.module.embedded:true}")
     private boolean useEmbeddedModule;
 
-    // 내장 모듈의 classpath 경로
     @Value("${terraform.module.resource-path:/terraform/modules/vsphere-vm}")
     private String moduleResourcePath;
 
-    // Git 모듈 소스 (예: git::https://...//vsphere-vm?ref=v1.2.3)
     @Value("${terraform.module.source:}")
     private String moduleSourceProp;
 
-    // 로컬 디렉토리 경로
     @Value("${terraform.module.localDir:}")
     private String moduleLocalDir;
 
-    private final ResourceLoader resourceLoader;
-    private final ObjectMapper om = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
+    @Value("${worker.id}")
+    private String workerId;
 
-    /**
-     * 기존 Listener 시그니처 호환: execute(ProvisionJobMessage msg)
-     */
+    @Value("${rabbitmq.exchange.result.name}")
+    private String resultExchange;
+
+    @Value("${rabbitmq.routing-key.result}")
+    private String resultRoutingKey;
+
+    private final ResourceLoader resourceLoader;
+    private final RabbitTemplate rabbitTemplate;
+    private final ObjectMapper om;
+
+    // 현재 쓰레드에서 실행 중인 jobId (로그 이벤트에 사용)
+    private final ThreadLocal<String> currentJobId = new ThreadLocal<>();
+
+    public TerraformExecutor(ResourceLoader resourceLoader,
+                             RabbitTemplate rabbitTemplate,
+                             ObjectMapper objectMapper) {
+        this.resourceLoader = resourceLoader;
+        this.rabbitTemplate = rabbitTemplate;
+        this.om = objectMapper.copy().enable(SerializationFeature.INDENT_OUTPUT);
+    }
+
+    // ===== 외부에서 호출하는 진입점 =====
+
     public String execute(ProvisionJobMessage msg) {
         Objects.requireNonNull(msg, "ProvisionJobMessage must not be null");
 
-        long jobId = parseJobId(safeInvoke(msg, "getJobId"));
-        String vmName = nvl((String) safeInvoke(msg, "getVmName"), "vm-" + jobId);
-        String action = resolveAction(msg);
+        Object rawJobId = safeInvoke(msg, "getJobId");
+        String jobIdStr = rawJobId != null ? String.valueOf(rawJobId) : String.valueOf(System.currentTimeMillis());
+        long jobId = parseJobId(rawJobId);
 
-        // 작업 디렉토리
-        File workDir = new File("/tmp/terraform/" + jobId);
-        if (!workDir.exists() && !workDir.mkdirs()) {
-            throw new RuntimeException("Failed to create workDir: " + workDir.getAbsolutePath());
+        currentJobId.set(jobIdStr);
+        try {
+            String vmName = nvl(msg.getVmName(), "vm-" + jobId);
+            String action = resolveAction(msg);
+
+            File workDir = new File("/tmp/terraform/" + jobIdStr);
+            if (!workDir.exists() && !workDir.mkdirs()) {
+                throw new RuntimeException("Failed to create workDir: " + workDir.getAbsolutePath());
+            }
+
+            Map<String, Object> tfVars = buildTfVarsFromMessage(msg, vmName);
+
+            execute(jobId, vmName, action, workDir, tfVars);
+            return vmName;
+        } finally {
+            currentJobId.remove();
         }
-
-        // tfvars 구성
-        Map<String, Object> tfVars = buildTfVarsFromMessage(msg, vmName);
-
-        // 실행
-        execute(jobId, vmName, action, workDir, tfVars);
-
-        // 기존 시그니처가 String을 기대하므로 식별용으로 vmName 반환
-        return vmName;
     }
 
-    /**
-     * (권장) 통합 실행 진입점.
-     */
     public void execute(long jobId, String vmName, String action, File workDir, Map<String, Object> tfVars) {
         Objects.requireNonNull(workDir, "workDir must not be null");
         if (!workDir.exists() && !workDir.mkdirs()) {
@@ -90,36 +102,59 @@ public class TerraformExecutor {
 
         log.info("Starting Terraform execution for jobId={}, vmName={}, action={}", jobId, vmName, action);
 
-        // 환경 변수
         Map<String, String> env = new HashMap<>();
         env.put("TF_IN_AUTOMATION", "1");
 
-        // 1) .tf 없으면 모듈 스테이징
         ensureModulePresent(workDir, env);
 
-        // 2) vars 파일 쓰기
         if (tfVars != null && !tfVars.isEmpty()) {
             File vars = new File(workDir, VARS_FILE_NAME);
             writeVarsFile(vars, tfVars);
             log.info("Wrote vars file: {}", vars.getAbsolutePath());
-        } else {
-            log.debug("No tfvars content provided. Skipping vars file write.");
         }
 
-        // 3) 실행 플로우
         runTerraformSequence(workDir, env, action);
     }
 
-    /**
-     * 간소화 오버로드
-     */
     public void execute(File workDir, String action) {
         Map<String, String> env = Map.of("TF_IN_AUTOMATION", "1");
         ensureModulePresent(workDir, env);
         runTerraformSequence(workDir, env, action);
     }
 
-    // ===== 모듈 스테이징 (내장 모듈 우선) =====
+    // ===== LOG 이벤트 전송 =====
+
+    private void sendLogEvent(String jobId, String step, String line) {
+        if (jobId == null) return;
+
+        try {
+            ProvisionResultMessage msg = new ProvisionResultMessage();
+            msg.setJobId(jobId);
+            msg.setEventType(ProvisionResultMessage.EventType.LOG);
+            msg.setStatus("LOG");
+            msg.setStep(step);
+            msg.setMessage(line);
+            msg.setTimestamp(OffsetDateTime.now());
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, msg, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+        } catch (Exception e) {
+            log.warn("[TerraformExecutor] Failed to send LOG event for jobId={}: {}", jobId, e.getMessage());
+        }
+    }
+
+    private String resolveStepName(String... cmd) {
+        if (cmd == null || cmd.length == 0) return "terraform";
+        if (cmd.length >= 2 && "terraform".equals(cmd[0])) {
+            return "terraform_" + cmd[1];
+        }
+        return String.join("_", cmd);
+    }
+
+    // ===== 모듈 스테이징 =====
 
     private void ensureModulePresent(File dir, Map<String, String> env) {
         log.debug("=== ensureModulePresent START ===");
@@ -134,7 +169,6 @@ public class TerraformExecutor {
 
         log.info("No .tf files found. Starting module staging...");
 
-        // 우선순위 1: 내장 모듈 (JAR 내부)
         if (useEmbeddedModule && isNotBlank(moduleResourcePath)) {
             log.info("✓ Using embedded module from classpath: {}", moduleResourcePath);
             try {
@@ -148,7 +182,6 @@ public class TerraformExecutor {
             }
         }
 
-        // 우선순위 2: Git 모듈
         String src = normalizeEmptyToNull(moduleSourceProp);
         if (src == null) {
             src = normalizeEmptyToNull(System.getenv("TERRAFORM_MODULE_SOURCE"));
@@ -162,7 +195,6 @@ public class TerraformExecutor {
             return;
         }
 
-        // 우선순위 3: 로컬 디렉토리
         String localDir = normalizeEmptyToNull(moduleLocalDir);
         log.debug("Checking local module directory: '{}'", localDir);
 
@@ -177,52 +209,18 @@ public class TerraformExecutor {
             }
         }
 
-        // 설정 없음
         log.error("✗ No Terraform module source configured!");
-        log.error("   useEmbeddedModule: {}", useEmbeddedModule);
-        log.error("   moduleResourcePath: '{}'", moduleResourcePath);
-        log.error("   moduleSourceProp: '{}'", moduleSourceProp);
-        log.error("   TERRAFORM_MODULE_SOURCE env: '{}'", System.getenv("TERRAFORM_MODULE_SOURCE"));
-        log.error("   moduleLocalDir: '{}'", moduleLocalDir);
-
-        throw new RuntimeException(
-                "No Terraform configuration found and no module source configured.\n" +
-                        "╭─────────────────────────────────────────────────────────╮\n" +
-                        "│  해결 방법 (택 1):                                       │\n" +
-                        "│                                                         │\n" +
-                        "│  1. 내장 모듈 사용 (권장):                              │\n" +
-                        "│     src/main/resources/terraform/modules/vsphere-vm/    │\n" +
-                        "│     에 .tf 파일들을 배치하고                            │\n" +
-                        "│     application.properties 설정:                        │\n" +
-                        "│     terraform.module.embedded=true                      │\n" +
-                        "│     terraform.module.resource-path=                     │\n" +
-                        "│       /terraform/modules/vsphere-vm                     │\n"+
-                        "│                                                         │\n" +
-                        "│  2. Git 저장소 사용:                                    │\n" +
-                        "│     terraform.module.embedded=false                     │\n" +
-                        "│     terraform.module.source=                            │\n" +
-                        "│       git::https://github.com/...?ref=v1.0              │\n" +
-                        "│                                                         │\n" +
-                        "│  3. 로컬 디렉토리 사용:                                 │\n" +
-                        "│     terraform.module.embedded=false                     │\n" +
-                        "│     terraform.module.localDir=/path/to/modules          │\n" +
-                        "╰─────────────────────────────────────────────────────────╯");
+        throw new RuntimeException("No Terraform configuration found and no module source configured.");
     }
 
-    /**
-     * classpath(JAR 내부)에서 Terraform 모듈 추출
-     */
     private void stageModuleFromClasspath(File targetDir) throws IOException {
         log.info("Extracting embedded Terraform module to {}", targetDir.getAbsolutePath());
 
         PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
         String pattern = "classpath:" + moduleResourcePath + "/**/*.tf";
 
-        log.debug("Scanning pattern: {}", pattern);
         Resource[] resources = resolver.getResources(pattern);
-
         if (resources == null || resources.length == 0) {
-            // .tf.json도 시도
             pattern = "classpath:" + moduleResourcePath + "/**/*.tf.json";
             resources = resolver.getResources(pattern);
         }
@@ -233,14 +231,11 @@ public class TerraformExecutor {
 
         log.info("Found {} Terraform file(s) in classpath", resources.length);
 
-        // 각 리소스를 대상 디렉토리로 복사
         for (Resource resource : resources) {
             String filename = resource.getFilename();
             if (filename == null) continue;
 
             File targetFile = new File(targetDir, filename);
-            log.debug("Copying {} to {}", filename, targetFile.getAbsolutePath());
-
             try (InputStream is = resource.getInputStream();
                  FileOutputStream fos = new FileOutputStream(targetFile)) {
                 byte[] buffer = new byte[8192];
@@ -258,35 +253,23 @@ public class TerraformExecutor {
         }
     }
 
-    /**
-     * Git 또는 레지스트리에서 모듈 스테이징
-     */
     private void stageModuleFromSource(File dir, Map<String, String> env, String source) {
         log.info("Staging module via 'terraform init -from-module={}'", source);
 
         try {
-            // from-module로 초기 구성 가져오기
             executeCommand(dir, env, "terraform", "init", "-from-module=" + source, "-input=false", "-no-color");
             log.info("✓ Module staged from source");
-
-            // provider 다운로드를 위한 추가 init
             executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
             log.info("✓ Providers initialized");
 
             if (!hasTfFiles(dir)) {
                 throw new RuntimeException("Module staging completed but no .tf files found");
             }
-
-            log.info("✓ Module staging completed successfully");
-
         } catch (Exception e) {
             throw new RuntimeException("Failed to stage module from source: " + source, e);
         }
     }
 
-    /**
-     * 로컬 디렉토리에서 모듈 복사
-     */
     private void stageModuleFromLocal(File dir, Map<String, String> env, Path localPath) {
         log.info("Staging module by copying from: {}", localPath);
 
@@ -298,24 +281,16 @@ public class TerraformExecutor {
                 throw new RuntimeException("Copied from local directory but no .tf files present");
             }
 
-            // provider 다운로드
             executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
             log.info("✓ Providers initialized");
-
-            log.info("✓ Local module staging completed successfully");
 
         } catch (Exception e) {
             throw new RuntimeException("Failed to stage module from local directory: " + localPath, e);
         }
     }
 
-    /**
-     * 빈 문자열을 null로 변환 (Spring의 빈 문자열 주입 처리)
-     */
     private String normalizeEmptyToNull(String s) {
-        if (s == null || s.trim().isEmpty()) {
-            return null;
-        }
+        if (s == null || s.trim().isEmpty()) return null;
         return s.trim();
     }
 
@@ -345,14 +320,11 @@ public class TerraformExecutor {
         }
     }
 
-    // ===== 실행 시퀀스 =====
+    // ===== 실행 시퀀스 + 커맨드 =====
 
     private void runTerraformSequence(File dir, Map<String, String> env, String action) {
-        // 필수 단계
         executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
         executeCommand(dir, env, "terraform", "validate", "-no-color");
-
-        // 포맷은 비치명적
         executeCommandOrSkip(dir, env, false, "terraform", "fmt", "-recursive", "-write=true");
 
         if ("apply".equalsIgnoreCase(action)) {
@@ -371,7 +343,7 @@ public class TerraformExecutor {
             executeCommand(dir, env, cmd);
         } catch (RuntimeException e) {
             if (!failHard) {
-                log.warn("[Terraform][non-fatal] '{}' 실패(무시하고 계속 진행): {}",
+                log.warn("[Terraform][non-fatal] '{}' 실패(무시하고 진행): {}",
                         String.join(" ", cmd), firstLine(e.getMessage()));
                 return;
             }
@@ -382,6 +354,9 @@ public class TerraformExecutor {
     private void executeCommand(File dir, Map<String, String> env, String... cmd) {
         String display = String.join(" ", cmd);
         log.info("Executing: {} (dir: {})", display, dir.getAbsolutePath());
+
+        final String jobId = currentJobId.get();
+        final String step = resolveStepName(cmd);
 
         ProcessBuilder pb = new ProcessBuilder(cmd)
                 .directory(dir)
@@ -397,11 +372,13 @@ public class TerraformExecutor {
             CountDownLatch latch = new CountDownLatch(2);
 
             Thread tOut = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
                     while ((line = br.readLine()) != null) {
                         stdoutBuf.append(line).append('\n');
                         log.info("[terraform] {}", line);
+                        sendLogEvent(jobId, step, line);
                     }
                 } catch (IOException ignore) {
                 } finally {
@@ -410,11 +387,13 @@ public class TerraformExecutor {
             }, "tf-stdout");
 
             Thread tErr = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
                     String line;
                     while ((line = br.readLine()) != null) {
                         stderrBuf.append(line).append('\n');
                         log.error("[terraform] {}", line);
+                        sendLogEvent(jobId, step, line);
                     }
                 } catch (IOException ignore) {
                 } finally {
@@ -428,7 +407,9 @@ public class TerraformExecutor {
             boolean finished = p.waitFor(DEFAULT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             if (!finished) {
                 p.destroyForcibly();
-                throw new RuntimeException("Command timed out: " + display);
+                String msg = "Command timed out: " + display;
+                sendLogEvent(jobId, step, msg);
+                throw new RuntimeException(msg);
             }
 
             latch.await(5, TimeUnit.SECONDS);
@@ -436,12 +417,15 @@ public class TerraformExecutor {
             int exit = p.exitValue();
             if (exit != 0) {
                 String merged = mergeOutErr(stdoutBuf.toString(), stderrBuf.toString());
-                throw wrapTerraformException(new RuntimeException(
-                        "Command failed: " + display + " (exit " + exit + ")\n" + merged));
+                String msg = "Command failed: " + display + " (exit " + exit + ")\n" + merged;
+                sendLogEvent(jobId, step, firstLine(msg));
+                throw wrapTerraformException(new RuntimeException(msg));
             }
         } catch (IOException | InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw wrapTerraformException(new RuntimeException("Command failed to start/run: " + display, e));
+            String msg = "Command failed to start/run: " + display + " - " + e.getMessage();
+            sendLogEvent(jobId, step, firstLine(msg));
+            throw wrapTerraformException(new RuntimeException(msg, e));
         }
     }
 

@@ -10,12 +10,11 @@ import java.util.Map;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ProvisionJobMessage {
 
-    // 기존 필드(유지)
+    // 기본 필드
     private String jobId;
     private Object providerType;
     private Long zoneId;
 
-    // ★ 추가: API에서 실어주는 사용자/팀 정보
     private Long userId;
     private Long teamId;
 
@@ -28,36 +27,37 @@ public class ProvisionJobMessage {
     private Map<String, String> tags;
     private Map<String, Object> additionalConfig;
 
-    // ★ 추가 필드(API와 동일)
+    // 추가 스펙
     private TemplateRef template;
     private OsSpec os;
     private NetSpec net;
     private PropertiesSpec properties;
 
     // ---------- Nested Types ----------
+
     @Data
     public static class TemplateRef {
-        private String itemName;           // os_image.template_name
-        private String templateMoid;       // os_image.template_moid (있으면 우선)
-        private String templateDatastore;  // os_image.template_datastore
-        private String guestId;            // os_image.guest_id
-        private String contentLibraryName; // 선택
-        private String uuid;               // (선택) 미래에 UUID를 직접 줄 수도 있음
+        private String itemName;
+        private String templateMoid;
+        private String templateDatastore;
+        private String guestId;
+        private String contentLibraryName;
+        private String uuid;
     }
 
     @Data
     public static class OsSpec {
-        private String family;   // ubuntu | rocky | windows
-        private String version;  // "22.04" 등
-        private String variant;  // minimal 등
-        private String arch;     // x86_64 등
+        private String family;
+        private String version;
+        private String variant;
+        private String arch;
     }
 
     @Data
     public static class NetSpec {
         private String mode;     // DHCP | STATIC
-        private String iface;    // ens192 등
-        private Ipv4 ipv4;       // STATIC일 때만
+        private String iface;
+        private Ipv4 ipv4;
         private List<String> dns;
 
         @Data

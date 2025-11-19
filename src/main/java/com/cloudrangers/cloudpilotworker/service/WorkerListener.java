@@ -18,6 +18,9 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 @Service
@@ -51,13 +54,11 @@ public class WorkerListener {
         try {
             msg = coerceToProvisionJobMessage(raw);
 
-            // 람다에서 사용할 final 값
             final String jobId   = msg.getJobId();
             final String corrIn  = toCorrString(correlationIdRaw) != null ? toCorrString(correlationIdRaw) : jobId;
-            final String corrOut = jobId;     // 결과 correlationId는 항상 jobId
-            final String jobIdHeader = jobId; // fallback 헤더
+            final String corrOut = jobId;
+            final String jobIdHeader = jobId;
 
-            // 상세한 메시지 로깅
             log.info("[Worker:{}] ===== Received Provision Job =====", workerId);
             log.info("[Worker:{}] JobID: {}, CorrelationID: {}", workerId, jobId, corrIn);
             log.info("[Worker:{}] VM Config: name={}, count={}, cpu={}, mem={}GB, disk={}GB",
@@ -83,7 +84,7 @@ public class WorkerListener {
 
             log.info("[Worker:{}] ===================================", workerId);
 
-            // 필수 필드 검증
+            // 기본 검증
             if (msg.getVmName() == null || msg.getVmName().isBlank()) {
                 throw new IllegalArgumentException("vmName is required");
             }
@@ -97,24 +98,68 @@ public class WorkerListener {
                 throw new IllegalArgumentException("diskGb must be positive");
             }
 
-            // 실제 실행
+            // Terraform 실행 (내부에서 LOG 이벤트는 이미 스트리밍 중)
             String vmId = terraformExecutor.execute(msg);
 
-            // 성공 결과 통지
+            // ===== SUCCESS 이벤트 + InstanceInfo 세팅 =====
             ProvisionResultMessage result = new ProvisionResultMessage();
             result.setJobId(jobId);
+            result.setEventType(ProvisionResultMessage.EventType.SUCCESS);
             result.setStatus("SUCCEEDED");
             result.setVmId(vmId);
             result.setMessage("ok");
+            result.setTimestamp(OffsetDateTime.now());
 
+            // TODO: 지금은 요청 스펙 기반으로만 InstanceInfo 채움.
+            //       나중에 terraform output -json 파싱해서 IP / moid / uuid 반영하자.
+            List<ProvisionResultMessage.InstanceInfo> instances = new ArrayList<>();
+
+            int vmCount = (msg.getVmCount() != null && msg.getVmCount() > 0) ? msg.getVmCount() : 1;
+            for (int i = 0; i < vmCount; i++) {
+                ProvisionResultMessage.InstanceInfo inst = new ProvisionResultMessage.InstanceInfo();
+
+                // 이름: 단건이면 그대로, 다건이면 suffix 붙이기
+                String baseName = msg.getVmName();
+                String name = (vmCount == 1) ? baseName : baseName + "-" + (i + 1);
+                inst.setName(name);
+
+                // externalId: 지금은 vmId + 인덱스 정도만 전달 (추후 moid/uuid로 교체 예정)
+                String externalId = (vmCount == 1) ? vmId : vmId + "#" + (i + 1);
+                inst.setExternalId(externalId);
+
+                if (msg.getZoneId() != null) {
+                    inst.setZoneId(msg.getZoneId());
+                }
+                if (msg.getProviderType() != null) {
+                    inst.setProviderType(String.valueOf(msg.getProviderType()));
+                }
+
+                inst.setCpuCores(msg.getCpuCores());
+                inst.setMemoryGb(msg.getMemoryGb());
+                inst.setDiskGb(msg.getDiskGb());
+
+                // IP / OS 타입은 일단 비워두거나, 가능한 정보가 있으면 채우기
+                inst.setIpAddress(null); // TODO: terraform output에서 주입
+                if (msg.getOs() != null && msg.getOs().getFamily() != null) {
+                    inst.setOsType(msg.getOs().getFamily());
+                } else if (msg.getTemplate() != null && msg.getTemplate().getGuestId() != null) {
+                    inst.setOsType(msg.getTemplate().getGuestId());
+                }
+
+                instances.add(inst);
+            }
+
+            result.setInstances(instances);
+
+            // 결과 메시지 전송
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
-                m.getMessageProperties().setCorrelationId(corrOut); // String 미지원이면 byte[]로 교체
-                // m.getMessageProperties().setCorrelationId(corrOut.getBytes(StandardCharsets.UTF_8));
+                m.getMessageProperties().setCorrelationId(corrOut);
                 m.getMessageProperties().setHeader("jobId", jobIdHeader);
                 return m;
             });
 
-            log.info("[Worker:{}] ✓ Job completed successfully. jobId={}, vmId={}", workerId, jobId, vmId);
+            log.info("[Worker:{}] ✓ Job completed successfully. jobId={}, vmId={}, instances={}",
+                    workerId, jobId, vmId, instances);
 
         } catch (Exception e) {
             final String fallbackCorr =
@@ -130,30 +175,31 @@ public class WorkerListener {
 
             ProvisionResultMessage result = new ProvisionResultMessage();
             result.setJobId(fallbackCorr);
+            result.setEventType(ProvisionResultMessage.EventType.ERROR);
             result.setStatus("FAILED");
             result.setMessage(e.getMessage());
+            result.setTimestamp(OffsetDateTime.now());
 
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
                 m.getMessageProperties().setCorrelationId(fallbackCorr);
-                // m.getMessageProperties().setCorrelationId(fallbackCorr.getBytes(StandardCharsets.UTF_8));
                 if (jobIdHeader != null) {
                     m.getMessageProperties().setHeader("jobId", jobIdHeader);
                 }
                 return m;
             });
 
-            // 재큐 없이 DLX로
+            // 재큐 없이 DLX 로
             throw new AmqpRejectAndDontRequeueException("Listener failed, send to DLX", e);
         }
     }
 
-    /** 다양한 입력(JSON String/byte[], Map, DTO, AMQP Message)을 DTO로 강제 변환 */
+    // ===== Payload → ProvisionJobMessage 변환 =====
+
     private ProvisionJobMessage coerceToProvisionJobMessage(Object raw) throws Exception {
         log.debug("[Worker:{}] ===== coerceToProvisionJobMessage START =====", workerId);
         log.debug("[Worker:{}] Input type: {}", workerId, raw.getClass().getName());
 
         if (raw instanceof ProvisionJobMessage pjm) {
-            log.debug("[Worker:{}] ✓ Direct ProvisionJobMessage instance", workerId);
             return pjm;
         }
 
@@ -163,96 +209,58 @@ public class WorkerListener {
             String typeId = headers != null && headers.get("__TypeId__") != null
                     ? String.valueOf(headers.get("__TypeId__")) : null;
 
-            log.debug("[Worker:{}] AMQP Message - body length: {}, __TypeId__: {}",
-                    workerId, body.length, typeId);
-
             String bodyStr = new String(body, StandardCharsets.UTF_8);
 
-            // ===== 중요: 실제 JSON 내용 전체 출력 =====
-            log.info("[Worker:{}] ===== ACTUAL JSON CONTENT =====", workerId);
+            log.info("[Worker:{}] ===== RAW JSON =====", workerId);
             log.info("[Worker:{}] {}", workerId, bodyStr);
-            log.info("[Worker:{}] ================================", workerId);
+            log.info("[Worker:{}] ===================", workerId);
 
-            // 1) 바로 DTO로 파싱 시도
             try {
                 ProvisionJobMessage result = objectMapper.readValue(body, ProvisionJobMessage.class);
-                log.debug("[Worker:{}] ✓ Direct DTO parse successful", workerId);
-
-                // 파싱 후 필드 확인
-                log.debug("[Worker:{}] Parsed - vmName: {}, cpuCores: {}, memoryGb: {}",
-                        workerId, result.getVmName(), result.getCpuCores(), result.getMemoryGb());
-
                 return result;
             } catch (MismatchedInputException e) {
                 log.warn("[Worker:{}] Direct DTO parse failed (MismatchedInputException): {}", workerId, e.getMessage());
             } catch (Exception e) {
                 log.warn("[Worker:{}] Direct DTO parse failed: {}", workerId, e.getMessage());
-                log.debug("[Worker:{}] Parse error details:", workerId, e);
             }
 
-            // 2) 문자열 JSON(__TypeId__=java.lang.String 또는 바깥따옴표)
             String s = bodyStr.trim();
             if ("java.lang.String".equals(typeId) || (s.startsWith("\"") && s.endsWith("\""))) {
                 try {
-                    String inner = objectMapper.readValue(s, String.class); // 바깥 따옴표 벗기기
-                    log.debug("[Worker:{}] Nested JSON detected, inner: {}", workerId, inner);
-                    ProvisionJobMessage result = objectMapper.readValue(inner, ProvisionJobMessage.class);
-                    log.debug("[Worker:{}] ✓ Nested JSON parse successful", workerId);
-                    return result;
-                } catch (Exception e2) {
-                    log.debug("[Worker:{}] Nested JSON parse failed: {}", workerId, e2.toString());
-                }
+                    String inner = objectMapper.readValue(s, String.class);
+                    return objectMapper.readValue(inner, ProvisionJobMessage.class);
+                } catch (Exception ignore) { }
             }
 
-            // 3) Map으로 온 경우
             try {
                 Map<String, Object> m = objectMapper.readValue(body, new TypeReference<Map<String, Object>>() {});
-                log.info("[Worker:{}] Parsed as Map, keys: {}", workerId, m.keySet());
-                log.info("[Worker:{}] Map content: {}", workerId, m);
-
-                ProvisionJobMessage result = objectMapper.convertValue(m, ProvisionJobMessage.class);
-                log.debug("[Worker:{}] ✓ Map conversion successful", workerId);
-
-                // 변환 후 필드 확인
-                log.debug("[Worker:{}] Converted - vmName: {}, cpuCores: {}, memoryGb: {}",
-                        workerId, result.getVmName(), result.getCpuCores(), result.getMemoryGb());
-
-                return result;
+                return objectMapper.convertValue(m, ProvisionJobMessage.class);
             } catch (Exception e3) {
-                log.error("[Worker:{}] All parsing attempts failed.", workerId);
-                log.error("[Worker:{}] Error: {}", workerId, e3.getMessage(), e3);
+                log.error("[Worker:{}] All parsing attempts failed.", workerId, e3);
                 throw new IllegalArgumentException("Unsupported payload; failed to parse JSON", e3);
             }
         }
 
         if (raw instanceof String s) {
-            log.debug("[Worker:{}] String payload: {}", workerId, s);
-            // 바깥따옴표로 감싼 문자열 JSON도 처리
             if (s.startsWith("\"") && s.endsWith("\"")) {
                 String inner = objectMapper.readValue(s, String.class);
-                log.debug("[Worker:{}] Unwrapped nested string", workerId);
                 return objectMapper.readValue(inner, ProvisionJobMessage.class);
             }
             return objectMapper.readValue(s, ProvisionJobMessage.class);
         }
 
         if (raw instanceof byte[] b) {
-            log.debug("[Worker:{}] Byte array payload, length: {}", workerId, b.length);
             String content = new String(b, StandardCharsets.UTF_8);
             log.info("[Worker:{}] Byte array content: {}", workerId, content);
             return objectMapper.readValue(b, ProvisionJobMessage.class);
         }
 
         if (raw instanceof Map<?, ?> m) {
-            log.debug("[Worker:{}] Map payload, keys: {}", workerId, m.keySet());
-            log.info("[Worker:{}] Map payload: {}", workerId, m);
             return objectMapper.convertValue(m, ProvisionJobMessage.class);
         }
 
         String preview = String.valueOf(raw);
         if (preview.length() > 200) preview = preview.substring(0, 200) + "...";
-        log.error("[Worker:{}] Unsupported payload type: {}, preview: {}",
-                workerId, raw.getClass().getName(), preview);
         throw new IllegalArgumentException("Unsupported payload type: " + raw.getClass().getName()
                 + ", preview=" + preview);
     }
