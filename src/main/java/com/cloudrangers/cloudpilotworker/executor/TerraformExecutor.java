@@ -196,7 +196,7 @@ public class TerraformExecutor {
                         "│     application.properties 설정:                        │\n" +
                         "│     terraform.module.embedded=true                      │\n" +
                         "│     terraform.module.resource-path=                     │\n" +
-                        "│       /terraform/modules/vsphere-vm                     │\n" +
+                        "│       /terraform/modules/vsphere-vm                     │\n"+
                         "│                                                         │\n" +
                         "│  2. Git 저장소 사용:                                    │\n" +
                         "│     terraform.module.embedded=false                     │\n" +
@@ -460,9 +460,9 @@ public class TerraformExecutor {
         Map<String, Object> tf = new LinkedHashMap<>();
 
         // === vSphere 연결 정보 (환경 변수에서) ===
-        tf.put("vsphere_server", nvl(System.getenv("VSPHERE_SERVER"), "vcenter.example.com"));
-        tf.put("vsphere_user", nvl(System.getenv("VSPHERE_USER"), "administrator@vsphere.local"));
-        tf.put("vsphere_password", nvl(System.getenv("VSPHERE_PASSWORD"), ""));
+        tf.put("vsphere_server", nvl(System.getenv("VSPHERE_SERVER"), "vcenter.fisa.com"));
+        tf.put("vsphere_user", nvl(System.getenv("VSPHERE_USER"), "administrator@fisa.ce5"));
+        tf.put("vsphere_password", System.getenv("VSPHERE_PASSWORD"));
         tf.put("allow_unverified_ssl", Boolean.parseBoolean(nvl(System.getenv("VSPHERE_ALLOW_UNVERIFIED_SSL"), "true")));
 
         // === vSphere 리소스 위치 ===
@@ -485,12 +485,6 @@ public class TerraformExecutor {
                 nvl(System.getenv("VSPHERE_DATASTORE"), "HDD1 (1)")
         ));
 
-        Object networkObj = safeInvoke(msg, "getNetwork");
-        tf.put("network", nvl(
-                networkObj != null ? String.valueOf(networkObj) : null,
-                nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN")
-        ));
-
         Object folderObj = safeInvoke(msg, "getFolder");
         tf.put("folder", nvl(
                 folderObj != null ? String.valueOf(folderObj) : null,
@@ -501,7 +495,7 @@ public class TerraformExecutor {
         tf.put("vm_name", vmName);
         tf.put("vm_count", safe((Number) safeInvoke(msg, "getVmCount"), 1));
 
-        // Template 이름
+        // Template / 추가 설정
         Object addCfg = safeInvoke(msg, "getAdditionalConfig");
         Map<String, Object> add = (addCfg instanceof Map) ? (Map<String, Object>) addCfg : Collections.emptyMap();
 
@@ -513,7 +507,7 @@ public class TerraformExecutor {
                 templateName = reflectString(templateObj, "getItemName");
             }
         }
-        tf.put("template_name", nvl(templateName, "ubuntu-22.04-gold"));
+        tf.put("template_name", templateName);
 
         // 리소스 스펙
         tf.put("cpu_cores", safe((Number) safeInvoke(msg, "getCpuCores"), 2));
@@ -524,7 +518,23 @@ public class TerraformExecutor {
         String diskProv = asString(add.getOrDefault("diskProvisioning", "thin"));
         tf.put("disk_provisioning", diskProv.toLowerCase()); // thin, thick, thick_eager
 
-        // === 네트워크 설정 ===
+        // === 네트워크 설정 (팀/존/추가 설정 기반, 다중 NIC 지원) ===
+        Long teamId = toLong(safeInvoke(msg, "getTeamId"));
+        Long zoneId = toLong(safeInvoke(msg, "getZoneId"));
+
+        List<String> networks = resolveNetworkNames(msg, add, teamId, zoneId);
+        if (!networks.isEmpty()) {
+            // 첫 번째 NIC
+            tf.put("network", networks.get(0));
+            // 두 번째 이후 NIC
+            if (networks.size() > 1) {
+                tf.put("extra_networks", networks.subList(1, networks.size()));
+            }
+        } else {
+            // 최종 fallback
+            tf.put("network", nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN"));
+        }
+
         String ipMode = asString(add.getOrDefault("ipAllocationMode", "DHCP"));
         tf.put("ip_allocation_mode", ipMode.toUpperCase()); // DHCP or STATIC
 
@@ -575,6 +585,87 @@ public class TerraformExecutor {
         }
 
         return tf;
+    }
+
+    /**
+     * 팀/존/요청 additionalConfig를 기반으로 vSphere 네트워크 목록 결정
+     *
+     * 우선순위:
+     *  1) additionalConfig.networks (list 형태)
+     *  2) additionalConfig.network (string)
+     *  3) msg.getNetwork() / ENV / 기본값
+     *
+     * + 특수 룰:
+     *  - teamId == 1 이면 ["VLAN101_TeamA", "PG_WAN"] 두 개가 반드시 포함되도록 보정
+     */
+    private List<String> resolveNetworkNames(ProvisionJobMessage msg,
+                                             Map<String, Object> additionalConfig,
+                                             Long teamId,
+                                             Long zoneId) {
+        List<String> networks = new ArrayList<>();
+
+        // 1) additionalConfig.networks (List)
+        if (additionalConfig != null) {
+            Object networksObj = additionalConfig.get("networks");
+            if (networksObj instanceof List<?> list) {
+                for (Object o : list) {
+                    if (o != null) {
+                        String s = String.valueOf(o);
+                        if (isNotBlank(s)) {
+                            networks.add(s);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) additionalConfig.network (String)
+        if (networks.isEmpty() && additionalConfig != null) {
+            Object networkFromReq = additionalConfig.get("network");
+            if (networkFromReq != null) {
+                String s = String.valueOf(networkFromReq);
+                if (isNotBlank(s)) {
+                    networks.add(s);
+                }
+            }
+        }
+
+        // 3) 기존 msg.getNetwork() / ENV / 기본값
+        if (networks.isEmpty()) {
+            Object networkObj = safeInvoke(msg, "getNetwork");
+            String base = nvl(
+                    networkObj != null ? String.valueOf(networkObj) : null,
+                    nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN")
+            );
+            if (isNotBlank(base)) {
+                networks.add(base);
+            }
+        }
+
+        // ★ 특수 룰: teamId == 1 이면 VLAN101_TeamA + PG_WAN 두 개 붙이기
+        if (teamId != null && teamId == 1L) {
+            String teamVlan = "VLAN101_TeamA";
+            String wanNet = "PG-WAN";
+
+            // 팀 VLAN을 항상 첫 번째로
+            if (!networks.contains(teamVlan)) {
+                networks.add(0, teamVlan);
+            }
+
+            if (!networks.contains(wanNet)) {
+                networks.add(wanNet);
+            }
+        }
+
+        // 그래도 비어 있으면 마지막 fallback
+        if (networks.isEmpty()) {
+            networks.add("PG-WAN");
+        }
+
+        log.info("[TerraformExecutor] Resolved networks for teamId={}, zoneId={} => {}",
+                teamId, zoneId, networks);
+
+        return networks;
     }
 
     // ===== action 유추 =====
@@ -664,6 +755,16 @@ public class TerraformExecutor {
             return Long.parseLong(String.valueOf(v));
         } catch (Exception e) {
             return System.currentTimeMillis();
+        }
+    }
+
+    private Long toLong(Object v) {
+        if (v == null) return null;
+        try {
+            if (v instanceof Number n) return n.longValue();
+            return Long.parseLong(String.valueOf(v));
+        } catch (Exception e) {
+            return null;
         }
     }
 

@@ -15,6 +15,10 @@ public class ProvisionJobMessage {
     private Object providerType;
     private Long zoneId;
 
+    // ★ 추가: API에서 실어주는 사용자/팀 정보
+    private Long userId;
+    private Long teamId;
+
     private Integer vmCount;
     private String vmName;
     private Integer cpuCores;
