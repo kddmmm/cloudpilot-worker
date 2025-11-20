@@ -87,8 +87,21 @@ public class TerraformExecutor {
 
             Map<String, Object> tfVars = buildTfVarsFromMessage(msg, vmName);
 
-            execute(jobId, vmName, action, workDir, tfVars);
-            return vmName;
+            try {
+                // 실제 Terraform 실행
+                execute(jobId, vmName, action, workDir, tfVars);
+
+                // 프로비저닝(apply)일 때만 SUCCESS 이벤트 전송
+                if ("apply".equalsIgnoreCase(action)) {
+                    sendSuccessEvent(jobIdStr, msg, vmName, tfVars);
+                }
+
+                return vmName;
+            } catch (RuntimeException e) {
+                // 실패 시 ERROR 이벤트 전송
+                sendErrorEvent(jobIdStr, e);
+                throw e;
+            }
         } finally {
             currentJobId.remove();
         }
@@ -122,7 +135,7 @@ public class TerraformExecutor {
         runTerraformSequence(workDir, env, action);
     }
 
-    // ===== LOG 이벤트 전송 =====
+    // ===== LOG / SUCCESS / ERROR 이벤트 전송 =====
 
     private void sendLogEvent(String jobId, String step, String line) {
         if (jobId == null) return;
@@ -143,6 +156,119 @@ public class TerraformExecutor {
             });
         } catch (Exception e) {
             log.warn("[TerraformExecutor] Failed to send LOG event for jobId={}: {}", jobId, e.getMessage());
+        }
+    }
+
+    /**
+     * Terraform 전체 시퀀스가 정상 종료된 뒤, JobResultConsumer → vmProvisionService에서
+     * vm_instance를 만들 수 있도록 SUCCESS 이벤트 전송.
+     */
+    private void sendSuccessEvent(String jobId,
+                                  ProvisionJobMessage msg,
+                                  String vmName,
+                                  Map<String, Object> tfVars) {
+        if (jobId == null) return;
+
+        try {
+            ProvisionResultMessage result = new ProvisionResultMessage();
+            result.setJobId(jobId);
+            result.setEventType(ProvisionResultMessage.EventType.SUCCESS);
+            result.setStatus("SUCCEEDED");
+            result.setStep("terraform_apply");
+            result.setTimestamp(OffsetDateTime.now());
+
+            // VM 개수 추론
+            int vmCount = 1;
+            Object vmCountObj = tfVars != null ? tfVars.get("vm_count") : null;
+            if (vmCountObj instanceof Number n) {
+                vmCount = Math.max(1, n.intValue());
+            } else {
+                Object v = safeInvoke(msg, "getVmCount");
+                if (v instanceof Number n2) {
+                    vmCount = Math.max(1, n2.intValue());
+                } else if (v != null) {
+                    try {
+                        vmCount = Math.max(1, Integer.parseInt(String.valueOf(v)));
+                    } catch (Exception ignore) { }
+                }
+            }
+
+            Long zoneId = toLong(safeInvoke(msg, "getZoneId"));
+            String providerType = reflectString(msg, "getProviderType", "getProvider");
+
+            Integer cpuCores = null;
+            Integer memoryGb = null;
+            Integer diskGb = null;
+
+            Object oCpu = safeInvoke(msg, "getCpuCores");
+            if (oCpu instanceof Number n) cpuCores = n.intValue();
+            Object oMem = safeInvoke(msg, "getMemoryGb");
+            if (oMem instanceof Number n2) memoryGb = n2.intValue();
+            Object oDisk = safeInvoke(msg, "getDiskGb");
+            if (oDisk instanceof Number n3) diskGb = n3.intValue();
+
+            List<ProvisionResultMessage.InstanceInfo> instances = new ArrayList<>();
+            for (int i = 0; i < vmCount; i++) {
+                ProvisionResultMessage.InstanceInfo info = new ProvisionResultMessage.InstanceInfo();
+                String name = (vmCount == 1) ? vmName : vmName + "-" + (i + 1);
+
+                info.setName(name);
+                info.setExternalId(null);   // TODO: 필요하면 Terraform state/outputs에서 채우기
+                info.setZoneId(zoneId);
+                info.setProviderType(providerType);
+                info.setCpuCores(cpuCores);
+                info.setMemoryGb(memoryGb);
+                info.setDiskGb(diskGb);
+                info.setIpAddress(null);    // TODO: 나중에 IP 파싱 로직 추가
+                info.setOsType(null);
+
+                instances.add(info);
+            }
+
+            result.setInstances(instances);
+            if (!instances.isEmpty()) {
+                result.setVmId(instances.get(0).getName());
+            }
+
+            result.setMessage("Terraform apply succeeded (" + vmCount + " VM(s))");
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+
+            log.info("[TerraformExecutor] Sent SUCCESS event for jobId={}, vmCount={}", jobId, vmCount);
+        } catch (Exception e) {
+            log.warn("[TerraformExecutor] Failed to send SUCCESS event for jobId={}: {}", jobId, e.getMessage());
+        }
+    }
+
+    /**
+     * Terraform 실행 과정에서 예외가 발생했을 때 ERROR 이벤트 전송.
+     * (JobResultConsumer → handleErrorEvent에서 Job 상태 failed 처리)
+     */
+    private void sendErrorEvent(String jobId, RuntimeException e) {
+        if (jobId == null) return;
+
+        try {
+            ProvisionResultMessage result = new ProvisionResultMessage();
+            result.setJobId(jobId);
+            result.setEventType(ProvisionResultMessage.EventType.ERROR);
+            result.setStatus("FAILED");
+            result.setStep("terraform");
+            result.setTimestamp(OffsetDateTime.now());
+            result.setMessage(firstLine(e.getMessage()));
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+
+            log.warn("[TerraformExecutor] Sent ERROR event for jobId={}: {}", jobId, firstLine(e.getMessage()));
+        } catch (Exception ex) {
+            log.warn("[TerraformExecutor] Failed to send ERROR event for jobId={}: {}", jobId, ex.getMessage());
         }
     }
 
