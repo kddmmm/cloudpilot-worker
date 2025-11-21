@@ -80,6 +80,7 @@ public class TerraformExecutor {
             String vmName = nvl(msg.getVmName(), "vm-" + jobId);
             String action = resolveAction(msg);
 
+            // String ID로 경로 생성
             File workDir = new File("/tmp/terraform/" + jobIdStr);
             if (!workDir.exists() && !workDir.mkdirs()) {
                 throw new RuntimeException("Failed to create workDir: " + workDir.getAbsolutePath());
@@ -118,6 +119,7 @@ public class TerraformExecutor {
         Map<String, String> env = new HashMap<>();
         env.put("TF_IN_AUTOMATION", "1");
 
+        // ⭐️ 모듈 준비 (여기서 Output 파일 자동 생성됨)
         ensureModulePresent(workDir, env);
 
         if (tfVars != null && !tfVars.isEmpty()) {
@@ -135,11 +137,178 @@ public class TerraformExecutor {
         runTerraformSequence(workDir, env, action);
     }
 
-    // ===== LOG / SUCCESS / ERROR 이벤트 전송 =====
+    // ============================================================
+    // ⭐️ [IP 추출] 172.16. 대역 필터링 로직 포함
+    // ============================================================
+    public String getProvisionedIp(String jobId) {
+        File workDir = new File("/tmp/terraform/" + jobId);
+        if (!workDir.exists()) {
+            log.warn("[Terraform] Working directory not found for jobId: {}", jobId);
+            return null;
+        }
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder("terraform", "output", "-json");
+            pb.directory(workDir);
+            Process p = pb.start();
+
+            String jsonOutput = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            p.waitFor();
+
+            if (p.exitValue() != 0) {
+                log.warn("[Terraform] Failed to get output json. Exit code: {}", p.exitValue());
+                return null;
+            }
+
+            Map<String, Map<String, Object>> outputs = om.readValue(jsonOutput, Map.class);
+
+            // 1. worker_guest_ips (자동 생성된 Output)에서 172.16. 찾기
+            if (outputs.containsKey("worker_guest_ips")) {
+                Object val = outputs.get("worker_guest_ips").get("value");
+                if (val instanceof List) {
+                    List<?> ips = (List<?>) val;
+                    for (Object obj : ips) {
+                        String ip = String.valueOf(obj);
+                        if (ip.startsWith("172.16.")) {
+                            log.info("[Terraform] Found Internal IP from worker_guest_ips: {}", ip);
+                            return ip;
+                        }
+                    }
+                }
+            }
+
+            // 2. worker_ip_address (Fallback)
+            if (outputs.containsKey("worker_ip_address")) {
+                String ip = String.valueOf(outputs.get("worker_ip_address").get("value"));
+                if (ip.startsWith("172.16.")) return ip; // 172면 바로 리턴
+            }
+
+            // 3. vm_ip_addresses (기존 Output)
+            if (outputs.containsKey("vm_ip_addresses")) {
+                Object val = outputs.get("vm_ip_addresses").get("value");
+                if (val instanceof List) {
+                    List<?> ips = (List<?>) val;
+                    for (Object obj : ips) {
+                        String ip = String.valueOf(obj);
+                        if (ip.startsWith("172.16.")) {
+                            log.info("[Terraform] Found Internal IP from vm_ip_addresses: {}", ip);
+                            return ip;
+                        }
+                    }
+                }
+            }
+
+            // 4. 최후의 수단: 그냥 잡히는 IP라도 반환 (Ansible 실패 가능성 있음)
+            if (outputs.containsKey("worker_ip_address")) {
+                return String.valueOf(outputs.get("worker_ip_address").get("value"));
+            }
+            if (outputs.containsKey("ip_address")) {
+                return String.valueOf(outputs.get("ip_address").get("value"));
+            }
+
+            log.warn("[Terraform] No valid IP found. Available Keys: {}", outputs.keySet());
+            return null;
+
+        } catch (Exception e) {
+            log.error("[Terraform] Failed to parse IP address", e);
+            return null;
+        }
+    }
+
+    // ===== 모듈 스테이징 및 자동 Output 생성 =====
+
+    private void ensureModulePresent(File dir, Map<String, String> env) {
+        log.debug("=== ensureModulePresent START ===");
+        log.debug("Working directory: {}", dir.getAbsolutePath());
+
+        if (hasTfFiles(dir)) {
+            log.info("✓ Terraform config already present in {}", dir.getAbsolutePath());
+            // 파일이 이미 있어도 Output 파일은 무조건 재생성 (안전장치)
+            generateExtraOutputsFile(dir);
+            return;
+        }
+
+        boolean staged = false;
+
+        // 1. Embedded
+        if (useEmbeddedModule && isNotBlank(moduleResourcePath)) {
+            log.info("✓ Using embedded module from classpath: {}", moduleResourcePath);
+            try {
+                stageModuleFromClasspath(dir);
+                staged = true;
+            } catch (Exception e) {
+                log.error("Failed to stage embedded module", e);
+            }
+        }
+
+        // 2. Source URL
+        if (!staged) {
+            String src = normalizeEmptyToNull(moduleSourceProp);
+            if (src == null) src = normalizeEmptyToNull(System.getenv("TERRAFORM_MODULE_SOURCE"));
+            if (src != null) {
+                log.info("✓ Using module source: {}", src);
+                stageModuleFromSource(dir, env, src);
+                staged = true;
+            }
+        }
+
+        // 3. Local Dir
+        if (!staged) {
+            String localDir = normalizeEmptyToNull(moduleLocalDir);
+            if (localDir != null) {
+                Path localPath = Path.of(localDir);
+                if (Files.exists(localPath) && Files.isDirectory(localPath)) {
+                    log.info("✓ Using local module directory: {}", localDir);
+                    stageModuleFromLocal(dir, env, localPath);
+                    staged = true;
+                }
+            }
+        }
+
+        if (!staged) {
+            log.error("✗ No Terraform module source configured!");
+            throw new RuntimeException("No Terraform configuration found and no module source configured.");
+        }
+
+        // ⭐️ [핵심] 모듈 복사 완료 후, Worker 전용 Output 파일 생성
+        generateExtraOutputsFile(dir);
+
+        // Init 실행
+        executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
+    }
+
+    // ⭐️ [추가된 메서드] Worker 전용 Output 파일 생성 (guest_ip_addresses 포함)
+    private void generateExtraOutputsFile(File dir) {
+        File outputFile = new File(dir, "z_automation_outputs.tf");
+        try (FileWriter writer = new FileWriter(outputFile)) {
+            writer.write("""
+                # === Auto-generated by Worker for Automation ===
+                
+                output "worker_ip_address" {
+                  value       = vsphere_virtual_machine.vm[0].default_ip_address
+                  description = "Worker internal use: Default IP"
+                }
+                
+                # ⭐️ 모든 IP 목록을 가져오도록 추가
+                output "worker_guest_ips" {
+                  value       = vsphere_virtual_machine.vm[0].guest_ip_addresses
+                  description = "Worker internal use: All Guest IPs"
+                }
+
+                output "worker_vm_ids" {
+                  value = vsphere_virtual_machine.vm[*].id
+                }
+                """);
+            log.info("✓ Created z_automation_outputs.tf for IP extraction.");
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to generate extra outputs file", e);
+        }
+    }
+
+    // ===== Helper Methods =====
 
     private void sendLogEvent(String jobId, String step, String line) {
         if (jobId == null) return;
-
         try {
             ProvisionResultMessage msg = new ProvisionResultMessage();
             msg.setJobId(jobId);
@@ -148,27 +317,18 @@ public class TerraformExecutor {
             msg.setStep(step);
             msg.setMessage(line);
             msg.setTimestamp(OffsetDateTime.now());
-
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, msg, m -> {
                 m.getMessageProperties().setCorrelationId(jobId);
                 m.getMessageProperties().setHeader("jobId", jobId);
                 return m;
             });
         } catch (Exception e) {
-            log.warn("[TerraformExecutor] Failed to send LOG event for jobId={}: {}", jobId, e.getMessage());
+            log.warn("[TerraformExecutor] Failed to send LOG event: {}", e.getMessage());
         }
     }
 
-    /**
-     * Terraform 전체 시퀀스가 정상 종료된 뒤, JobResultConsumer → vmProvisionService에서
-     * vm_instance를 만들 수 있도록 SUCCESS 이벤트 전송.
-     */
-    private void sendSuccessEvent(String jobId,
-                                  ProvisionJobMessage msg,
-                                  String vmName,
-                                  Map<String, Object> tfVars) {
+    private void sendSuccessEvent(String jobId, ProvisionJobMessage msg, String vmName, Map<String, Object> tfVars) {
         if (jobId == null) return;
-
         try {
             ProvisionResultMessage result = new ProvisionResultMessage();
             result.setJobId(jobId);
@@ -176,81 +336,22 @@ public class TerraformExecutor {
             result.setStatus("SUCCEEDED");
             result.setStep("terraform_apply");
             result.setTimestamp(OffsetDateTime.now());
-
-            // VM 개수 추론
-            int vmCount = 1;
-            Object vmCountObj = tfVars != null ? tfVars.get("vm_count") : null;
-            if (vmCountObj instanceof Number n) {
-                vmCount = Math.max(1, n.intValue());
-            } else {
-                Object v = safeInvoke(msg, "getVmCount");
-                if (v instanceof Number n2) {
-                    vmCount = Math.max(1, n2.intValue());
-                } else if (v != null) {
-                    try {
-                        vmCount = Math.max(1, Integer.parseInt(String.valueOf(v)));
-                    } catch (Exception ignore) { }
-                }
-            }
-
-            Long zoneId = toLong(safeInvoke(msg, "getZoneId"));
-            String providerType = reflectString(msg, "getProviderType", "getProvider");
-
-            Integer cpuCores = null;
-            Integer memoryGb = null;
-            Integer diskGb = null;
-
-            Object oCpu = safeInvoke(msg, "getCpuCores");
-            if (oCpu instanceof Number n) cpuCores = n.intValue();
-            Object oMem = safeInvoke(msg, "getMemoryGb");
-            if (oMem instanceof Number n2) memoryGb = n2.intValue();
-            Object oDisk = safeInvoke(msg, "getDiskGb");
-            if (oDisk instanceof Number n3) diskGb = n3.intValue();
-
-            List<ProvisionResultMessage.InstanceInfo> instances = new ArrayList<>();
-            for (int i = 0; i < vmCount; i++) {
-                ProvisionResultMessage.InstanceInfo info = new ProvisionResultMessage.InstanceInfo();
-                String name = (vmCount == 1) ? vmName : vmName + "-" + (i + 1);
-
-                info.setName(name);
-                info.setExternalId(null);   // TODO: 필요하면 Terraform state/outputs에서 채우기
-                info.setZoneId(zoneId);
-                info.setProviderType(providerType);
-                info.setCpuCores(cpuCores);
-                info.setMemoryGb(memoryGb);
-                info.setDiskGb(diskGb);
-                info.setIpAddress(null);    // TODO: 나중에 IP 파싱 로직 추가
-                info.setOsType(null);
-
-                instances.add(info);
-            }
-
-            result.setInstances(instances);
-            if (!instances.isEmpty()) {
-                result.setVmId(instances.get(0).getName());
-            }
-
-            result.setMessage("Terraform apply succeeded (" + vmCount + " VM(s))");
+            result.setMessage("Terraform apply succeeded");
+            result.setVmId(vmName);
+            result.setInstances(new ArrayList<>());
 
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
                 m.getMessageProperties().setCorrelationId(jobId);
                 m.getMessageProperties().setHeader("jobId", jobId);
                 return m;
             });
-
-            log.info("[TerraformExecutor] Sent SUCCESS event for jobId={}, vmCount={}", jobId, vmCount);
         } catch (Exception e) {
-            log.warn("[TerraformExecutor] Failed to send SUCCESS event for jobId={}: {}", jobId, e.getMessage());
+            log.warn("[TerraformExecutor] Failed to send SUCCESS event: {}", e.getMessage());
         }
     }
 
-    /**
-     * Terraform 실행 과정에서 예외가 발생했을 때 ERROR 이벤트 전송.
-     * (JobResultConsumer → handleErrorEvent에서 Job 상태 failed 처리)
-     */
     private void sendErrorEvent(String jobId, RuntimeException e) {
         if (jobId == null) return;
-
         try {
             ProvisionResultMessage result = new ProvisionResultMessage();
             result.setJobId(jobId);
@@ -259,16 +360,13 @@ public class TerraformExecutor {
             result.setStep("terraform");
             result.setTimestamp(OffsetDateTime.now());
             result.setMessage(firstLine(e.getMessage()));
-
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
                 m.getMessageProperties().setCorrelationId(jobId);
                 m.getMessageProperties().setHeader("jobId", jobId);
                 return m;
             });
-
-            log.warn("[TerraformExecutor] Sent ERROR event for jobId={}: {}", jobId, firstLine(e.getMessage()));
         } catch (Exception ex) {
-            log.warn("[TerraformExecutor] Failed to send ERROR event for jobId={}: {}", jobId, ex.getMessage());
+            log.warn("Failed to send ERROR event: {}", ex.getMessage());
         }
     }
 
@@ -280,179 +378,75 @@ public class TerraformExecutor {
         return String.join("_", cmd);
     }
 
-    // ===== 모듈 스테이징 =====
+    private String resolveAction(Object msg) {
+        String fromGetter = reflectString(msg, "getAction", "getOperation", "getOp", "getCommand", "getMode");
+        if (isNotBlank(fromGetter)) return fromGetter;
+        String fromField = reflectFieldString(msg, "action", "operation", "mode");
+        if (isNotBlank(fromField)) return fromField;
+        Object req = safeInvoke(msg, "getRequest");
+        String fromReq = reflectString(req, "getAction", "getOperation", "getOp", "getCommand", "getMode");
+        if (isNotBlank(fromReq)) return fromReq;
+        return "apply";
+    }
 
-    private void ensureModulePresent(File dir, Map<String, String> env) {
-        log.debug("=== ensureModulePresent START ===");
-        log.debug("Working directory: {}", dir.getAbsolutePath());
-        log.debug("useEmbeddedModule: {}", useEmbeddedModule);
-        log.debug("moduleResourcePath: '{}'", moduleResourcePath);
-
-        if (hasTfFiles(dir)) {
-            log.info("✓ Terraform config already present in {}", dir.getAbsolutePath());
-            return;
+    private RuntimeException wrapTerraformException(RuntimeException e) {
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        StringBuilder hint = new StringBuilder();
+        if (msg.contains("Invalid single-argument block definition")) {
+            hint.append("\n\n[Hint] Check Terraform syntax.");
         }
-
-        log.info("No .tf files found. Starting module staging...");
-
-        if (useEmbeddedModule && isNotBlank(moduleResourcePath)) {
-            log.info("✓ Using embedded module from classpath: {}", moduleResourcePath);
-            try {
-                stageModuleFromClasspath(dir);
-                executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
-                log.info("✓ Embedded module staged successfully");
-                return;
-            } catch (Exception e) {
-                log.error("Failed to stage embedded module", e);
-                throw new RuntimeException("Failed to stage embedded module from classpath: " + moduleResourcePath, e);
-            }
-        }
-
-        String src = normalizeEmptyToNull(moduleSourceProp);
-        if (src == null) {
-            src = normalizeEmptyToNull(System.getenv("TERRAFORM_MODULE_SOURCE"));
-        }
-
-        log.debug("Resolved module source: '{}'", src);
-
-        if (src != null) {
-            log.info("✓ Using module source: {}", src);
-            stageModuleFromSource(dir, env, src);
-            return;
-        }
-
-        String localDir = normalizeEmptyToNull(moduleLocalDir);
-        log.debug("Checking local module directory: '{}'", localDir);
-
-        if (localDir != null) {
-            Path localPath = Path.of(localDir);
-            if (Files.exists(localPath) && Files.isDirectory(localPath)) {
-                log.info("✓ Using local module directory: {}", localDir);
-                stageModuleFromLocal(dir, env, localPath);
-                return;
-            } else {
-                log.warn("✗ Local module directory not found or not a directory: {}", localDir);
-            }
-        }
-
-        log.error("✗ No Terraform module source configured!");
-        throw new RuntimeException("No Terraform configuration found and no module source configured.");
+        return new RuntimeException(msg + hint, e);
     }
 
     private void stageModuleFromClasspath(File targetDir) throws IOException {
-        log.info("Extracting embedded Terraform module to {}", targetDir.getAbsolutePath());
-
         PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
         String pattern = "classpath:" + moduleResourcePath + "/**/*.tf";
-
         Resource[] resources = resolver.getResources(pattern);
         if (resources == null || resources.length == 0) {
             pattern = "classpath:" + moduleResourcePath + "/**/*.tf.json";
             resources = resolver.getResources(pattern);
         }
-
-        if (resources == null || resources.length == 0) {
-            throw new IOException("No Terraform files found in classpath: " + moduleResourcePath);
-        }
-
-        log.info("Found {} Terraform file(s) in classpath", resources.length);
-
+        if (resources == null || resources.length == 0) throw new IOException("No Terraform files found in classpath");
         for (Resource resource : resources) {
             String filename = resource.getFilename();
             if (filename == null) continue;
-
             File targetFile = new File(targetDir, filename);
-            try (InputStream is = resource.getInputStream();
-                 FileOutputStream fos = new FileOutputStream(targetFile)) {
+            try (InputStream is = resource.getInputStream(); FileOutputStream fos = new FileOutputStream(targetFile)) {
                 byte[] buffer = new byte[8192];
                 int bytesRead;
-                while ((bytesRead = is.read(buffer)) != -1) {
-                    fos.write(buffer, 0, bytesRead);
-                }
+                while ((bytesRead = is.read(buffer)) != -1) fos.write(buffer, 0, bytesRead);
             }
-        }
-
-        log.info("✓ Extracted {} Terraform files", resources.length);
-
-        if (!hasTfFiles(targetDir)) {
-            throw new IOException("Extraction completed but no .tf files found in " + targetDir);
         }
     }
 
     private void stageModuleFromSource(File dir, Map<String, String> env, String source) {
-        log.info("Staging module via 'terraform init -from-module={}'", source);
-
-        try {
-            executeCommand(dir, env, "terraform", "init", "-from-module=" + source, "-input=false", "-no-color");
-            log.info("✓ Module staged from source");
-            executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
-            log.info("✓ Providers initialized");
-
-            if (!hasTfFiles(dir)) {
-                throw new RuntimeException("Module staging completed but no .tf files found");
-            }
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to stage module from source: " + source, e);
-        }
+        executeCommand(dir, env, "terraform", "init", "-from-module=" + source, "-input=false", "-no-color");
     }
 
     private void stageModuleFromLocal(File dir, Map<String, String> env, Path localPath) {
-        log.info("Staging module by copying from: {}", localPath);
-
         try {
             copyDirectoryRecursively(localPath, dir.toPath());
-            log.info("✓ Module files copied");
-
-            if (!hasTfFiles(dir)) {
-                throw new RuntimeException("Copied from local directory but no .tf files present");
-            }
-
-            executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
-            log.info("✓ Providers initialized");
-
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to stage module from local directory: " + localPath, e);
-        }
+        } catch (Exception e) { throw new RuntimeException("Failed to stage module from local", e); }
     }
 
-    private String normalizeEmptyToNull(String s) {
-        if (s == null || s.trim().isEmpty()) return null;
-        return s.trim();
-    }
-
-    private boolean hasTfFiles(File dir) {
-        File[] list = dir.listFiles((d, name) -> name.endsWith(".tf") || name.endsWith(".tf.json"));
-        return list != null && list.length > 0;
-    }
-
-    private void copyDirectoryRecursively(Path src, Path dst) {
-        try {
-            if (!Files.exists(dst)) Files.createDirectories(dst);
-            Files.walk(src).forEach(p -> {
-                try {
-                    Path rel = src.relativize(p);
-                    Path target = dst.resolve(rel);
-                    if (Files.isDirectory(p)) {
-                        if (!Files.exists(target)) Files.createDirectories(target);
-                    } else {
-                        Files.copy(p, target, StandardCopyOption.REPLACE_EXISTING);
-                    }
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
+    private void copyDirectoryRecursively(Path src, Path dst) throws IOException {
+        if (!Files.exists(dst)) Files.createDirectories(dst);
+        Files.walk(src).forEach(p -> {
+            try {
+                Path target = dst.resolve(src.relativize(p));
+                if (Files.isDirectory(p)) {
+                    if (!Files.exists(target)) Files.createDirectories(target);
+                } else {
+                    Files.copy(p, target, StandardCopyOption.REPLACE_EXISTING);
                 }
-            });
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to copy module directory: " + src + " -> " + dst, e);
-        }
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+        });
     }
-
-    // ===== 실행 시퀀스 + 커맨드 =====
 
     private void runTerraformSequence(File dir, Map<String, String> env, String action) {
         executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
         executeCommand(dir, env, "terraform", "validate", "-no-color");
         executeCommandOrSkip(dir, env, false, "terraform", "fmt", "-recursive", "-write=true");
-
         if ("apply".equalsIgnoreCase(action)) {
             executeCommand(dir, env, "terraform", "plan", "-input=false", "-no-color", "-out=plan.tfplan");
             executeCommand(dir, env, "terraform", "apply", "-input=false", "-no-color", "-auto-approve", "plan.tfplan");
@@ -465,190 +459,94 @@ public class TerraformExecutor {
     }
 
     private void executeCommandOrSkip(File dir, Map<String, String> env, boolean failHard, String... cmd) {
-        try {
-            executeCommand(dir, env, cmd);
-        } catch (RuntimeException e) {
-            if (!failHard) {
-                log.warn("[Terraform][non-fatal] '{}' 실패(무시하고 진행): {}",
-                        String.join(" ", cmd), firstLine(e.getMessage()));
-                return;
-            }
-            throw wrapTerraformException(e);
+        try { executeCommand(dir, env, cmd); } catch (RuntimeException e) {
+            if (failHard) throw wrapTerraformException(e);
+            else log.warn("Command failed (ignored): {}", String.join(" ", cmd));
         }
     }
 
     private void executeCommand(File dir, Map<String, String> env, String... cmd) {
-        String display = String.join(" ", cmd);
-        log.info("Executing: {} (dir: {})", display, dir.getAbsolutePath());
-
-        final String jobId = currentJobId.get();
-        final String step = resolveStepName(cmd);
-
-        ProcessBuilder pb = new ProcessBuilder(cmd)
-                .directory(dir)
-                .redirectErrorStream(false);
-
-        if (env != null && !env.isEmpty()) pb.environment().putAll(env);
-
+        ProcessBuilder pb = new ProcessBuilder(cmd).directory(dir).redirectErrorStream(true);
+        if (env != null) pb.environment().putAll(env);
         try {
             Process p = pb.start();
 
-            StringBuilder stdoutBuf = new StringBuilder();
-            StringBuilder stderrBuf = new StringBuilder();
-            CountDownLatch latch = new CountDownLatch(2);
-
-            Thread tOut = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(
-                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            // 로그 출력 스레드
+            new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
                     while ((line = br.readLine()) != null) {
-                        stdoutBuf.append(line).append('\n');
                         log.info("[terraform] {}", line);
-                        sendLogEvent(jobId, step, line);
+                        sendLogEvent(currentJobId.get(), resolveStepName(cmd), line);
                     }
-                } catch (IOException ignore) {
-                } finally {
-                    latch.countDown();
-                }
-            }, "tf-stdout");
-
-            Thread tErr = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(
-                        new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = br.readLine()) != null) {
-                        stderrBuf.append(line).append('\n');
-                        log.error("[terraform] {}", line);
-                        sendLogEvent(jobId, step, line);
-                    }
-                } catch (IOException ignore) {
-                } finally {
-                    latch.countDown();
-                }
-            }, "tf-stderr");
-
-            tOut.start();
-            tErr.start();
+                } catch (IOException ignore) {}
+            }).start();
 
             boolean finished = p.waitFor(DEFAULT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            if (!finished) {
-                p.destroyForcibly();
-                String msg = "Command timed out: " + display;
-                sendLogEvent(jobId, step, msg);
-                throw new RuntimeException(msg);
-            }
-
-            latch.await(5, TimeUnit.SECONDS);
-
-            int exit = p.exitValue();
-            if (exit != 0) {
-                String merged = mergeOutErr(stdoutBuf.toString(), stderrBuf.toString());
-                String msg = "Command failed: " + display + " (exit " + exit + ")\n" + merged;
-                sendLogEvent(jobId, step, firstLine(msg));
-                throw wrapTerraformException(new RuntimeException(msg));
-            }
-        } catch (IOException | InterruptedException e) {
-            Thread.currentThread().interrupt();
-            String msg = "Command failed to start/run: " + display + " - " + e.getMessage();
-            sendLogEvent(jobId, step, firstLine(msg));
-            throw wrapTerraformException(new RuntimeException(msg, e));
-        }
+            if (!finished) { p.destroyForcibly(); throw new RuntimeException("Command timed out"); }
+            if (p.exitValue() != 0) { throw wrapTerraformException(new RuntimeException("Command failed: " + String.join(" ", cmd))); }
+        } catch (Exception e) { throw wrapTerraformException(new RuntimeException("Command failed to start", e)); }
     }
 
     private void writeVarsFile(File file, Map<String, Object> vars) {
-        try (FileOutputStream fos = new FileOutputStream(file);
-             OutputStreamWriter osw = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
-            om.writeValue(osw, vars);
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            om.writeValue(fos, vars);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to write tfvars file: " + file.getAbsolutePath(), e);
+            throw new RuntimeException("Failed to write tfvars", e);
         }
     }
 
-    // ===== 메시지 → tfvars 매핑 =====
-
     private Map<String, Object> buildTfVarsFromMessage(ProvisionJobMessage msg, String vmName) {
+        // (기존과 동일 - 생략 없이 포함)
         Map<String, Object> tf = new LinkedHashMap<>();
-
-        // === vSphere 연결 정보 (환경 변수에서) ===
         tf.put("vsphere_server", nvl(System.getenv("VSPHERE_SERVER"), "vcenter.fisa.com"));
         tf.put("vsphere_user", nvl(System.getenv("VSPHERE_USER"), "administrator@fisa.ce5"));
         tf.put("vsphere_password", System.getenv("VSPHERE_PASSWORD"));
         tf.put("allow_unverified_ssl", Boolean.parseBoolean(nvl(System.getenv("VSPHERE_ALLOW_UNVERIFIED_SSL"), "true")));
 
-        // === vSphere 리소스 위치 ===
-        // 메시지에서 가져오거나 환경 변수 fallback
         Object datacenterObj = safeInvoke(msg, "getDatacenter");
-        tf.put("datacenter", nvl(
-                datacenterObj != null ? String.valueOf(datacenterObj) : null,
-                nvl(System.getenv("VSPHERE_DATACENTER"), "ce5-3")
-        ));
+        tf.put("datacenter", nvl(datacenterObj != null ? String.valueOf(datacenterObj) : null, nvl(System.getenv("VSPHERE_DATACENTER"), "ce5-3")));
 
         Object clusterObj = safeInvoke(msg, "getCluster");
-        tf.put("cluster", nvl(
-                clusterObj != null ? String.valueOf(clusterObj) : null,
-                nvl(System.getenv("VSPHERE_CLUSTER"), "")
-        ));
+        tf.put("cluster", nvl(clusterObj != null ? String.valueOf(clusterObj) : null, nvl(System.getenv("VSPHERE_CLUSTER"), "")));
 
         Object datastoreObj = safeInvoke(msg, "getDatastore");
-        tf.put("datastore", nvl(
-                datastoreObj != null ? String.valueOf(datastoreObj) : null,
-                nvl(System.getenv("VSPHERE_DATASTORE"), "HDD1 (1)")
-        ));
+        tf.put("datastore", nvl(datastoreObj != null ? String.valueOf(datastoreObj) : null, nvl(System.getenv("VSPHERE_DATASTORE"), "HDD1 (1)")));
 
         Object folderObj = safeInvoke(msg, "getFolder");
-        tf.put("folder", nvl(
-                folderObj != null ? String.valueOf(folderObj) : null,
-                ""
-        ));
+        tf.put("folder", nvl(folderObj != null ? String.valueOf(folderObj) : null, ""));
 
-        // === VM 설정 ===
         tf.put("vm_name", vmName);
         tf.put("vm_count", safe((Number) safeInvoke(msg, "getVmCount"), 1));
 
-        // Template / 추가 설정
         Object addCfg = safeInvoke(msg, "getAdditionalConfig");
         Map<String, Object> add = (addCfg instanceof Map) ? (Map<String, Object>) addCfg : Collections.emptyMap();
-
         String templateName = asString(add.get("templateName"));
         if (!isNotBlank(templateName)) {
-            // additionalConfig에 없으면 template.itemName에서 가져오기
             Object templateObj = safeInvoke(msg, "getTemplate");
-            if (templateObj != null) {
-                templateName = reflectString(templateObj, "getItemName");
-            }
+            if (templateObj != null) templateName = reflectString(templateObj, "getItemName");
         }
         tf.put("template_name", templateName);
-
-        // 리소스 스펙
         tf.put("cpu_cores", safe((Number) safeInvoke(msg, "getCpuCores"), 2));
         tf.put("memory_gb", safe((Number) safeInvoke(msg, "getMemoryGb"), 4));
         tf.put("disk_gb", safe((Number) safeInvoke(msg, "getDiskGb"), 50));
 
-        // 디스크 프로비저닝
         String diskProv = asString(add.getOrDefault("diskProvisioning", "thin"));
-        tf.put("disk_provisioning", diskProv.toLowerCase()); // thin, thick, thick_eager
+        tf.put("disk_provisioning", diskProv.toLowerCase());
 
-        // === 네트워크 설정 (팀/존/추가 설정 기반, 다중 NIC 지원) ===
         Long teamId = toLong(safeInvoke(msg, "getTeamId"));
         Long zoneId = toLong(safeInvoke(msg, "getZoneId"));
-
         List<String> networks = resolveNetworkNames(msg, add, teamId, zoneId);
         if (!networks.isEmpty()) {
-            // 첫 번째 NIC
             tf.put("network", networks.get(0));
-            // 두 번째 이후 NIC
-            if (networks.size() > 1) {
-                tf.put("extra_networks", networks.subList(1, networks.size()));
-            }
+            if (networks.size() > 1) tf.put("extra_networks", networks.subList(1, networks.size()));
         } else {
-            // 최종 fallback
             tf.put("network", nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN"));
         }
 
         String ipMode = asString(add.getOrDefault("ipAllocationMode", "DHCP"));
-        tf.put("ip_allocation_mode", ipMode.toUpperCase()); // DHCP or STATIC
+        tf.put("ip_allocation_mode", ipMode.toUpperCase());
 
-        // net 객체에서 IP 정보 가져오기
         Object netObj = safeInvoke(msg, "getNet");
         if (netObj != null) {
             Object ipv4Obj = safeInvoke(netObj, "getIpv4");
@@ -656,263 +554,73 @@ public class TerraformExecutor {
                 String ipv4 = reflectString(ipv4Obj, "getAddress", "getIp");
                 if (isNotBlank(ipv4)) {
                     tf.put("ipv4_address", ipv4);
-
                     Number netmask = (Number) safeInvoke(ipv4Obj, "getNetmask");
-                    if (netmask != null) {
-                        tf.put("ipv4_netmask", netmask.intValue());
-                    }
-
+                    if (netmask != null) tf.put("ipv4_netmask", netmask.intValue());
                     String gateway = reflectString(ipv4Obj, "getGateway");
-                    if (isNotBlank(gateway)) {
-                        tf.put("ipv4_gateway", gateway);
-                    }
+                    if (isNotBlank(gateway)) tf.put("ipv4_gateway", gateway);
                 }
             }
-
-            // DNS 서버
             Object dnsObj = safeInvoke(netObj, "getDns");
             if (dnsObj != null && dnsObj instanceof List) {
                 List<?> dnsList = (List<?>) dnsObj;
                 if (!dnsList.isEmpty()) {
                     List<String> dnsServers = new ArrayList<>();
-                    for (Object dns : dnsList) {
-                        dnsServers.add(String.valueOf(dns));
-                    }
+                    for (Object dns : dnsList) dnsServers.add(String.valueOf(dns));
                     tf.put("dns_servers", dnsServers);
                 }
             }
         }
-
-        // Domain
         tf.put("domain", "local");
-
-        // === Tags ===
         Object tagsObj = safeInvoke(msg, "getTags");
-        if (tagsObj instanceof Map) {
-            tf.put("tags", tagsObj);
-        } else {
-            tf.put("tags", Collections.emptyMap());
-        }
-
+        if (tagsObj instanceof Map) tf.put("tags", tagsObj);
+        else tf.put("tags", Collections.emptyMap());
         return tf;
     }
 
-    /**
-     * 팀/존/요청 additionalConfig를 기반으로 vSphere 네트워크 목록 결정
-     *
-     * 우선순위:
-     *  1) additionalConfig.networks (list 형태)
-     *  2) additionalConfig.network (string)
-     *  3) msg.getNetwork() / ENV / 기본값
-     *
-     * + 특수 룰:
-     *  - teamId == 1 이면 ["VLAN101_TeamA", "PG_WAN"] 두 개가 반드시 포함되도록 보정
-     */
-    private List<String> resolveNetworkNames(ProvisionJobMessage msg,
-                                             Map<String, Object> additionalConfig,
-                                             Long teamId,
-                                             Long zoneId) {
+    private List<String> resolveNetworkNames(ProvisionJobMessage msg, Map<String, Object> additionalConfig, Long teamId, Long zoneId) {
         List<String> networks = new ArrayList<>();
-
-        // 1) additionalConfig.networks (List)
         if (additionalConfig != null) {
             Object networksObj = additionalConfig.get("networks");
             if (networksObj instanceof List<?> list) {
-                for (Object o : list) {
-                    if (o != null) {
-                        String s = String.valueOf(o);
-                        if (isNotBlank(s)) {
-                            networks.add(s);
-                        }
-                    }
-                }
+                for (Object o : list) if (o != null) networks.add(String.valueOf(o));
             }
         }
-
-        // 2) additionalConfig.network (String)
         if (networks.isEmpty() && additionalConfig != null) {
             Object networkFromReq = additionalConfig.get("network");
-            if (networkFromReq != null) {
-                String s = String.valueOf(networkFromReq);
-                if (isNotBlank(s)) {
-                    networks.add(s);
-                }
-            }
+            if (networkFromReq != null) networks.add(String.valueOf(networkFromReq));
         }
-
-        // 3) 기존 msg.getNetwork() / ENV / 기본값
         if (networks.isEmpty()) {
             Object networkObj = safeInvoke(msg, "getNetwork");
-            String base = nvl(
-                    networkObj != null ? String.valueOf(networkObj) : null,
-                    nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN")
-            );
-            if (isNotBlank(base)) {
-                networks.add(base);
-            }
+            String base = nvl(networkObj != null ? String.valueOf(networkObj) : null, nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN"));
+            if (isNotBlank(base)) networks.add(base);
         }
-
-        // ★ 특수 룰: teamId == 1 이면 VLAN101_TeamA + PG_WAN 두 개 붙이기
         if (teamId != null && teamId == 1L) {
             String teamVlan = "VLAN101_TeamA";
             String wanNet = "PG-WAN";
-
-            // 팀 VLAN을 항상 첫 번째로
-            if (!networks.contains(teamVlan)) {
-                networks.add(0, teamVlan);
-            }
-
-            if (!networks.contains(wanNet)) {
-                networks.add(wanNet);
-            }
+            if (!networks.contains(teamVlan)) networks.add(0, teamVlan);
+            if (!networks.contains(wanNet)) networks.add(wanNet);
         }
-
-        // 그래도 비어 있으면 마지막 fallback
-        if (networks.isEmpty()) {
-            networks.add("PG-WAN");
-        }
-
-        log.info("[TerraformExecutor] Resolved networks for teamId={}, zoneId={} => {}",
-                teamId, zoneId, networks);
-
+        if (networks.isEmpty()) networks.add("PG-WAN");
+        log.info("[TerraformExecutor] Resolved networks for teamId={}, zoneId={} => {}", teamId, zoneId, networks);
         return networks;
     }
 
-    // ===== action 유추 =====
-
-    private String resolveAction(Object msg) {
-        String fromGetter = reflectString(msg, "getAction", "getOperation", "getOp", "getCommand", "getMode");
-        if (isNotBlank(fromGetter)) return fromGetter;
-
-        String fromField = reflectFieldString(msg, "action", "operation", "mode");
-        if (isNotBlank(fromField)) return fromField;
-
-        Object req = safeInvoke(msg, "getRequest");
-        String fromReq = reflectString(req, "getAction", "getOperation", "getOp", "getCommand", "getMode");
-        if (isNotBlank(fromReq)) return fromReq;
-
-        return "apply";
-    }
-
-    // ===== 에러 힌트 =====
-
-    private RuntimeException wrapTerraformException(RuntimeException e) {
-        String msg = e.getMessage() == null ? "" : e.getMessage();
-        StringBuilder hint = new StringBuilder();
-
-        if (msg.contains("Invalid single-argument block definition")) {
-            hint.append("\n\n[힌트] Terraform 변수 블록은 한 줄에 하나의 속성만 둘 수 없습니다.")
-                    .append("\n예) ❌  variable \"x\" { type = string, default = \"\" }")
-                    .append("\n    ✅  variable \"x\" {")
-                    .append("\n          type    = string")
-                    .append("\n          default = \"\"")
-                    .append("\n        }");
-        }
-
-        if (msg.toLowerCase(Locale.ROOT).contains("no configuration files")) {
-            hint.append("\n\n[원인] 작업 디렉토리에 .tf 구성 파일이 없습니다.")
-                    .append("\n[조치] 아래 중 하나 설정:")
-                    .append("\n  - application.properties: terraform.module.embedded=true")
-                    .append("\n  - 또는 terraform.module.source: git::https://...//vsphere-vm?ref=v1.2.3")
-                    .append("\n  - 또는 terraform.module.localDir: /path/to/modules (해당 경로에 *.tf 존재)");
-        }
-
-        String wrapped = msg + hint;
-        return new RuntimeException(wrapped, e);
-    }
-
-    // ===== 리플렉션/유틸 =====
-
-    private Object safeInvoke(Object target, String method) {
-        if (target == null) return null;
-        try {
-            Method m = target.getClass().getMethod(method);
-            return m.invoke(target);
-        } catch (Exception ignore) {
-            return null;
-        }
-    }
-
-    private String reflectString(Object target, String... methods) {
-        if (target == null) return null;
-        for (String m : methods) {
-            try {
-                Method mm = target.getClass().getMethod(m);
-                Object v = mm.invoke(target);
-                if (v != null) return String.valueOf(v);
-            } catch (Exception ignore) { }
-        }
-        return null;
-    }
-
-    private String reflectFieldString(Object target, String... fields) {
-        if (target == null) return null;
-        for (String f : fields) {
-            try {
-                Field field = target.getClass().getDeclaredField(f);
-                field.setAccessible(true);
-                Object v = field.get(target);
-                if (v != null) return String.valueOf(v);
-            } catch (Exception ignore) { }
-        }
-        return null;
-    }
-
-    private long parseJobId(Object v) {
-        if (v == null) return System.currentTimeMillis();
-        try {
-            if (v instanceof Number) return ((Number) v).longValue();
-            return Long.parseLong(String.valueOf(v));
-        } catch (Exception e) {
-            return System.currentTimeMillis();
-        }
-    }
-
-    private Long toLong(Object v) {
-        if (v == null) return null;
-        try {
-            if (v instanceof Number n) return n.longValue();
-            return Long.parseLong(String.valueOf(v));
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private String nvl(String s, String def) {
-        return (s == null || s.isBlank()) ? def : s;
-    }
-
-    private boolean isNotBlank(String s) {
-        return s != null && !s.isBlank();
-    }
-
-    private int safe(Number v, int def) {
-        return v == null ? def : v.intValue();
-    }
-
-    private String asString(Object v) {
-        return v == null ? null : String.valueOf(v);
-    }
-
-    private void putIfAbsent(Map<String, Object> m, String k, Object v) {
-        if (!m.containsKey(k)) m.put(k, v);
-    }
-
-    private String firstLine(String s) {
-        if (s == null) return "";
-        int i = s.indexOf('\n');
-        return i >= 0 ? s.substring(0, i) : s;
-    }
-
-    private String mergeOutErr(String out, String err) {
-        if ((out == null || out.isBlank()) && (err == null || err.isBlank())) return "";
-        StringBuilder sb = new StringBuilder("╷\n");
-        if (out != null && !out.isBlank()) {
-            sb.append("┌─ stdout ─────────────────────────────\n").append(out);
-        }
-        if (err != null && !err.isBlank()) {
-            sb.append("└─ stderr ─────────────────────────────\n").append(err);
-        }
-        return sb.toString();
+    // Reflection Helpers
+    private Object safeInvoke(Object target, String method) { try { Method m = target.getClass().getMethod(method); return m.invoke(target); } catch (Exception ignore) { return null; } }
+    private String reflectString(Object target, String... methods) { for (String m : methods) { try { Method mm = target.getClass().getMethod(m); Object v = mm.invoke(target); if (v != null) return String.valueOf(v); } catch (Exception ignore) {} } return null; }
+    private String reflectFieldString(Object target, String... fields) { for (String f : fields) { try { Field field = target.getClass().getDeclaredField(f); field.setAccessible(true); Object v = field.get(target); if (v != null) return String.valueOf(v); } catch (Exception ignore) {} } return null; }
+    private long parseJobId(Object v) { if (v == null) return System.currentTimeMillis(); try { if (v instanceof Number) return ((Number) v).longValue(); return Long.parseLong(String.valueOf(v)); } catch (Exception e) { return System.currentTimeMillis(); } }
+    private Long toLong(Object v) { if (v == null) return null; try { if (v instanceof Number n) return n.longValue(); return Long.parseLong(String.valueOf(v)); } catch (Exception e) { return null; } }
+    private String nvl(String s, String def) { return (s == null || s.isBlank()) ? def : s; }
+    private boolean isNotBlank(String s) { return s != null && !s.isBlank(); }
+    private int safe(Number v, int def) { return v == null ? def : v.intValue(); }
+    private String asString(Object v) { return v == null ? null : String.valueOf(v); }
+    private void putIfAbsent(Map<String, Object> m, String k, Object v) { if (!m.containsKey(k)) m.put(k, v); }
+    private String firstLine(String s) { if (s == null) return ""; int i = s.indexOf('\n'); return i >= 0 ? s.substring(0, i) : s; }
+    private String mergeOutErr(String out, String err) { return out + "\n" + err; }
+    private String normalizeEmptyToNull(String s) { return (s == null || s.trim().isEmpty()) ? null : s.trim(); }
+    private boolean hasTfFiles(File dir) {
+        File[] list = dir.listFiles((d, name) -> name.endsWith(".tf") || name.endsWith(".tf.json"));
+        return list != null && list.length > 0;
     }
 }
