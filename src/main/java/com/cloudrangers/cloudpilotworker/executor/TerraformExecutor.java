@@ -2,6 +2,7 @@ package com.cloudrangers.cloudpilotworker.executor;
 
 import com.cloudrangers.cloudpilotworker.dto.ProvisionJobMessage;
 import com.cloudrangers.cloudpilotworker.dto.ProvisionResultMessage;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import lombok.extern.slf4j.Slf4j;
@@ -86,6 +87,7 @@ public class TerraformExecutor {
             }
 
             Map<String, Object> tfVars = buildTfVarsFromMessage(msg, vmName);
+            Map<String, Object> tfOutputs = Collections.emptyMap();
 
             try {
                 // 실제 Terraform 실행
@@ -93,7 +95,10 @@ public class TerraformExecutor {
 
                 // 프로비저닝(apply)일 때만 SUCCESS 이벤트 전송
                 if ("apply".equalsIgnoreCase(action)) {
-                    sendSuccessEvent(jobIdStr, msg, vmName, tfVars);
+                    Map<String, String> env = new HashMap<>();
+                    env.put("TF_IN_AUTOMATION", "1");
+                    tfOutputs = readTerraformOutputs(workDir, env);
+                    sendSuccessEvent(jobIdStr, msg, vmName, tfVars, tfOutputs);
                 }
 
                 return vmName;
@@ -162,12 +167,19 @@ public class TerraformExecutor {
     /**
      * Terraform 전체 시퀀스가 정상 종료된 뒤, JobResultConsumer → vmProvisionService에서
      * vm_instance를 만들 수 있도록 SUCCESS 이벤트 전송.
+     *
+     * @param tfOutputs terraform output -json 결과의 value 맵 (ip_address, vm_ip_addresses, vm_details 등)
      */
     private void sendSuccessEvent(String jobId,
                                   ProvisionJobMessage msg,
                                   String vmName,
-                                  Map<String, Object> tfVars) {
+                                  Map<String, Object> tfVars,
+                                  Map<String, Object> tfOutputs) {
         if (jobId == null) return;
+
+        if (tfOutputs == null) {
+            tfOutputs = Collections.emptyMap();
+        }
 
         try {
             ProvisionResultMessage result = new ProvisionResultMessage();
@@ -189,7 +201,8 @@ public class TerraformExecutor {
                 } else if (v != null) {
                     try {
                         vmCount = Math.max(1, Integer.parseInt(String.valueOf(v)));
-                    } catch (Exception ignore) { }
+                    } catch (Exception ignore) {
+                    }
                 }
             }
 
@@ -207,27 +220,159 @@ public class TerraformExecutor {
             Object oDisk = safeInvoke(msg, "getDiskGb");
             if (oDisk instanceof Number n3) diskGb = n3.intValue();
 
+            // terraform output에서 vm_details / vm_ip_addresses / ip_address 파싱
+            List<Map<String, Object>> vmDetails = extractVmDetails(tfOutputs);
+
+            List<?> vmIpAddressesRaw = null;
+            Object vmIpListObj = tfOutputs.get("vm_ip_addresses");
+            if (vmIpListObj instanceof List<?> list) {
+                vmIpAddressesRaw = list;
+            }
+
+            List<String> vmIpAddresses = null;
+            if (vmIpAddressesRaw != null) {
+                vmIpAddresses = new ArrayList<>();
+                for (Object o : vmIpAddressesRaw) {
+                    vmIpAddresses.add(normalizeIp(asString(o)));
+                }
+            }
+
+            String singleIp = normalizeIp(asString(tfOutputs.get("ip_address")));
+
             List<ProvisionResultMessage.InstanceInfo> instances = new ArrayList<>();
+
             for (int i = 0; i < vmCount; i++) {
                 ProvisionResultMessage.InstanceInfo info = new ProvisionResultMessage.InstanceInfo();
+
                 String name = (vmCount == 1) ? vmName : vmName + "-" + (i + 1);
+                String externalId = null;
+
+                // IP 후보
+                List<String> ipCandidates = new ArrayList<>();
+
+                // ===========================
+                // vm_details 기반 정보
+                // ===========================
+                Map<String, Object> detail = null;
+                if (!vmDetails.isEmpty() && i < vmDetails.size()) {
+                    detail = vmDetails.get(i);
+
+                    String detailName = asString(detail.get("name"));
+                    if (isNotBlank(detailName)) {
+                        name = detailName;
+                    }
+
+                    String moid = asString(detail.getOrDefault("moid", detail.get("id")));
+                    externalId = moid;
+
+                    // CPU
+                    Object cpuVal = detail.get("cpu_cores");
+                    if (cpuVal instanceof Number n) cpuCores = n.intValue();
+
+                    // Memory (MB → GB)
+                    Object memMbVal = detail.get("memory_mb");
+                    if (memMbVal instanceof Number n) memoryGb = Math.max(1, n.intValue() / 1024);
+
+                    // Disk
+                    Object diskGbVal = detail.get("total_disk_gb");
+                    if (diskGbVal instanceof Number n) diskGb = n.intValue();
+
+                    // IP 후보: ip_address
+                    String defaultIp = normalizeIp(asString(detail.get("ip_address")));
+                    if (defaultIp != null) {
+                        ipCandidates.add(defaultIp);
+                    }
+
+                    // IP 후보: guest_ip_addresses
+                    addCandidatesFromList(ipCandidates, detail.get("guest_ip_addresses"));
+                }
+
+                // ===========================
+                // vm_ip_addresses 기반 정보
+                // ===========================
+                if (vmIpAddresses != null && i < vmIpAddresses.size()) {
+                    String ip = normalizeIp(vmIpAddresses.get(i));
+                    if (ip != null) ipCandidates.add(ip);
+                }
+
+                if (singleIp != null && vmCount == 1) {
+                    ipCandidates.add(singleIp);
+                }
+
+                // tfvars 기반 STATIC IP
+                String ipFromTfVars = normalizeIp(asString(tfVars.get("ipv4_address")));
+                if (ipFromTfVars != null) {
+                    ipCandidates.add(ipFromTfVars);
+                }
+
+                // 요청 바디 기반 STATIC IP
+                Object netObj = safeInvoke(msg, "getNet");
+                if (netObj != null) {
+                    Object ipv4Obj = safeInvoke(netObj, "getIpv4");
+                    if (ipv4Obj != null) {
+                        String ip = normalizeIp(reflectString(ipv4Obj, "getAddress", "getIp"));
+                        if (ip != null) {
+                            ipCandidates.add(ip);
+                        }
+                    }
+                }
+
+                // ===========================
+                // 최종 Public IP 선택
+                // ===========================
+                String chosenIp = choosePreferredIp(ipCandidates);
+
+                // ===========================
+                // ⭐ NIC 전체 리스트 생성 (IPv4 전용, 172 대역만)
+                // ===========================
+                List<String> nicAddresses = new ArrayList<>();
+
+                if (detail != null) {
+                    Object guestIpObj = detail.get("guest_ip_addresses");
+                    if (guestIpObj instanceof List<?> rawList) {
+                        for (Object ipObj : rawList) {
+                            String ip = normalizeIp(asString(ipObj));
+                            if (ip != null
+                                    && ip.matches("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")
+                                    && ip.startsWith("172.")) {   // 172 대역만 수집
+                                nicAddresses.add(ip);
+                            }
+                        }
+                    }
+                }
+
+                // 리스트를 콤마 구분 문자열로 변환
+                String nicAddressesStr = nicAddresses.isEmpty()
+                        ? null
+                        : String.join(",", nicAddresses);
+
+                // ===========================
+                // info 필드 설정
+                // ===========================
+                info.setExternalId(externalId);
+                info.setIpAddress(chosenIp);
+                info.setNicAddresses(nicAddressesStr);
 
                 info.setName(name);
-                info.setExternalId(null);   // TODO: 필요하면 Terraform state/outputs에서 채우기
                 info.setZoneId(zoneId);
                 info.setProviderType(providerType);
                 info.setCpuCores(cpuCores);
                 info.setMemoryGb(memoryGb);
                 info.setDiskGb(diskGb);
-                info.setIpAddress(null);    // TODO: 나중에 IP 파싱 로직 추가
                 info.setOsType(null);
+
+                log.info("[TerraformExecutor] VM index={}, name={}, externalId={}, chosenIp={}, nicAddresses={}",
+                        i, name, externalId, chosenIp, nicAddressesStr);
 
                 instances.add(info);
             }
 
             result.setInstances(instances);
+
             if (!instances.isEmpty()) {
-                result.setVmId(instances.get(0).getName());
+                ProvisionResultMessage.InstanceInfo first = instances.get(0);
+                String vmId = isNotBlank(first.getExternalId()) ? first.getExternalId() : first.getName();
+                result.setVmId(vmId);
             }
 
             result.setMessage("Terraform apply succeeded (" + vmCount + " VM(s))");
@@ -238,7 +383,8 @@ public class TerraformExecutor {
                 return m;
             });
 
-            log.info("[TerraformExecutor] Sent SUCCESS event for jobId={}, vmCount={}", jobId, vmCount);
+            log.info("[TerraformExecutor] Sent SUCCESS event for jobId={}, vmCount={}, outputsKeys={}",
+                    jobId, vmCount, tfOutputs.keySet());
         } catch (Exception e) {
             log.warn("[TerraformExecutor] Failed to send SUCCESS event for jobId={}: {}", jobId, e.getMessage());
         }
@@ -246,7 +392,6 @@ public class TerraformExecutor {
 
     /**
      * Terraform 실행 과정에서 예외가 발생했을 때 ERROR 이벤트 전송.
-     * (JobResultConsumer → handleErrorEvent에서 Job 상태 failed 처리)
      */
     private void sendErrorEvent(String jobId, RuntimeException e) {
         if (jobId == null) return;
@@ -576,7 +721,6 @@ public class TerraformExecutor {
         tf.put("allow_unverified_ssl", Boolean.parseBoolean(nvl(System.getenv("VSPHERE_ALLOW_UNVERIFIED_SSL"), "true")));
 
         // === vSphere 리소스 위치 ===
-        // 메시지에서 가져오거나 환경 변수 fallback
         Object datacenterObj = safeInvoke(msg, "getDatacenter");
         tf.put("datacenter", nvl(
                 datacenterObj != null ? String.valueOf(datacenterObj) : null,
@@ -611,7 +755,6 @@ public class TerraformExecutor {
 
         String templateName = asString(add.get("templateName"));
         if (!isNotBlank(templateName)) {
-            // additionalConfig에 없으면 template.itemName에서 가져오기
             Object templateObj = safeInvoke(msg, "getTemplate");
             if (templateObj != null) {
                 templateName = reflectString(templateObj, "getItemName");
@@ -626,27 +769,25 @@ public class TerraformExecutor {
 
         // 디스크 프로비저닝
         String diskProv = asString(add.getOrDefault("diskProvisioning", "thin"));
-        tf.put("disk_provisioning", diskProv.toLowerCase()); // thin, thick, thick_eager
+        tf.put("disk_provisioning", diskProv.toLowerCase());
 
-        // === 네트워크 설정 (팀/존/추가 설정 기반, 다중 NIC 지원) ===
+        // === 네트워크 설정 (팀 VLAN 한 개만) ===
         Long teamId = toLong(safeInvoke(msg, "getTeamId"));
         Long zoneId = toLong(safeInvoke(msg, "getZoneId"));
 
         List<String> networks = resolveNetworkNames(msg, add, teamId, zoneId);
         if (!networks.isEmpty()) {
-            // 첫 번째 NIC
             tf.put("network", networks.get(0));
-            // 두 번째 이후 NIC
-            if (networks.size() > 1) {
-                tf.put("extra_networks", networks.subList(1, networks.size()));
-            }
         } else {
-            // 최종 fallback
-            tf.put("network", nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN"));
+            String defaultNet = normalizeEmptyToNull(System.getenv("VSPHERE_NETWORK"));
+            if (defaultNet == null) {
+                throw new RuntimeException("No vSphere network resolved. Please set VSPHERE_NETWORK or provide additionalConfig.network(s).");
+            }
+            tf.put("network", defaultNet);
         }
 
         String ipMode = asString(add.getOrDefault("ipAllocationMode", "DHCP"));
-        tf.put("ip_allocation_mode", ipMode.toUpperCase()); // DHCP or STATIC
+        tf.put("ip_allocation_mode", ipMode.toUpperCase());
 
         // net 객체에서 IP 정보 가져오기
         Object netObj = safeInvoke(msg, "getNet");
@@ -669,7 +810,6 @@ public class TerraformExecutor {
                 }
             }
 
-            // DNS 서버
             Object dnsObj = safeInvoke(netObj, "getDns");
             if (dnsObj != null && dnsObj instanceof List) {
                 List<?> dnsList = (List<?>) dnsObj;
@@ -683,10 +823,8 @@ public class TerraformExecutor {
             }
         }
 
-        // Domain
         tf.put("domain", "local");
 
-        // === Tags ===
         Object tagsObj = safeInvoke(msg, "getTags");
         if (tagsObj instanceof Map) {
             tf.put("tags", tagsObj);
@@ -699,14 +837,11 @@ public class TerraformExecutor {
 
     /**
      * 팀/존/요청 additionalConfig를 기반으로 vSphere 네트워크 목록 결정
-     *
      * 우선순위:
-     *  1) additionalConfig.networks (list 형태)
-     *  2) additionalConfig.network (string)
-     *  3) msg.getNetwork() / ENV / 기본값
-     *
-     * + 특수 룰:
-     *  - teamId == 1 이면 ["VLAN101_TeamA", "PG_WAN"] 두 개가 반드시 포함되도록 보정
+     *  1) additionalConfig.networks / additionalConfig.network
+     *  2) ProvisionJobMessage.getNetwork()
+     *  3) teamId 기반 하드코딩 매핑 (예: 1 -> VLAN101_TeamA)
+     *  4) VSPHERE_NETWORK 환경변수
      */
     private List<String> resolveNetworkNames(ProvisionJobMessage msg,
                                              Map<String, Object> additionalConfig,
@@ -714,62 +849,67 @@ public class TerraformExecutor {
                                              Long zoneId) {
         List<String> networks = new ArrayList<>();
 
-        // 1) additionalConfig.networks (List)
+        // 1) additionalConfig.networks
         if (additionalConfig != null) {
             Object networksObj = additionalConfig.get("networks");
             if (networksObj instanceof List<?> list) {
                 for (Object o : list) {
-                    if (o != null) {
-                        String s = String.valueOf(o);
-                        if (isNotBlank(s)) {
-                            networks.add(s);
-                        }
+                    if (o == null) continue;
+                    String s = String.valueOf(o).trim();
+                    if (isNotBlank(s)) {
+                        networks.add(s);
                     }
                 }
             }
         }
 
-        // 2) additionalConfig.network (String)
+        // 2) additionalConfig.network
         if (networks.isEmpty() && additionalConfig != null) {
             Object networkFromReq = additionalConfig.get("network");
             if (networkFromReq != null) {
-                String s = String.valueOf(networkFromReq);
+                String s = String.valueOf(networkFromReq).trim();
                 if (isNotBlank(s)) {
                     networks.add(s);
                 }
             }
         }
 
-        // 3) 기존 msg.getNetwork() / ENV / 기본값
+        // 3) ProvisionJobMessage.getNetwork()
         if (networks.isEmpty()) {
             Object networkObj = safeInvoke(msg, "getNetwork");
-            String base = nvl(
-                    networkObj != null ? String.valueOf(networkObj) : null,
-                    nvl(System.getenv("VSPHERE_NETWORK"), "PG-WAN")
-            );
-            if (isNotBlank(base)) {
-                networks.add(base);
+            if (networkObj != null) {
+                String base = String.valueOf(networkObj).trim();
+                if (isNotBlank(base)) {
+                    networks.add(base);
+                }
             }
         }
 
-        // ★ 특수 룰: teamId == 1 이면 VLAN101_TeamA + PG_WAN 두 개 붙이기
-        if (teamId != null && teamId == 1L) {
-            String teamVlan = "VLAN101_TeamA";
-            String wanNet = "PG-WAN";
-
-            // 팀 VLAN을 항상 첫 번째로
-            if (!networks.contains(teamVlan)) {
-                networks.add(0, teamVlan);
+        // 4) teamId 기반 하드코딩 매핑
+        if (networks.isEmpty() && teamId != null) {
+            if (teamId == 1L) {
+                // 🔥 teamId = 1 이면 VLAN101_TeamA 사용
+                networks.add("VLAN101_TeamA");
+                log.info("[TerraformExecutor] teamId={} → network='VLAN101_TeamA'", teamId);
             }
-
-            if (!networks.contains(wanNet)) {
-                networks.add(wanNet);
-            }
+            // 나중에 팀 늘어나면 여기서 else-if / switch 로 추가
+            // else if (teamId == 2L) { networks.add("VLAN102_TeamB"); } 등등
         }
 
-        // 그래도 비어 있으면 마지막 fallback
+        // 5) 글로벌 기본값: VSPHERE_NETWORK
         if (networks.isEmpty()) {
-            networks.add("PG-WAN");
+            String fromEnv = normalizeEmptyToNull(System.getenv("VSPHERE_NETWORK"));
+            if (fromEnv != null) {
+                networks.add(fromEnv);
+                log.info("[TerraformExecutor] Using default vSphere network from env VSPHERE_NETWORK={}", fromEnv);
+            }
+        }
+
+        if (networks.isEmpty()) {
+            throw new RuntimeException(
+                    "네트워크를 결정할 수 없습니다. teamId=" + teamId
+                            + " 에 대한 매핑 또는 VSPHERE_NETWORK, additionalConfig.network(s)를 설정하세요."
+            );
         }
 
         log.info("[TerraformExecutor] Resolved networks for teamId={}, zoneId={} => {}",
@@ -777,6 +917,8 @@ public class TerraformExecutor {
 
         return networks;
     }
+
+
 
     // ===== action 유추 =====
 
@@ -821,6 +963,131 @@ public class TerraformExecutor {
         return new RuntimeException(wrapped, e);
     }
 
+    // ===== terraform output -json 파싱 =====
+
+    private Map<String, Object> readTerraformOutputs(File dir, Map<String, String> env) {
+        String display = "terraform output -json";
+        log.info("Executing: {} (dir: {})", display, dir.getAbsolutePath());
+
+        final String jobId = currentJobId.get();
+        final String step = "terraform_output";
+
+        ProcessBuilder pb = new ProcessBuilder("terraform", "output", "-json")
+                .directory(dir)
+                .redirectErrorStream(false);
+
+        if (env != null && !env.isEmpty()) pb.environment().putAll(env);
+
+        try {
+            Process p = pb.start();
+
+            StringBuilder stdoutBuf = new StringBuilder();
+            StringBuilder stderrBuf = new StringBuilder();
+            CountDownLatch latch = new CountDownLatch(2);
+
+            Thread tOut = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        stdoutBuf.append(line).append('\n');
+                        log.info("[terraform-output] {}", line);
+                    }
+                } catch (IOException ignore) {
+                } finally {
+                    latch.countDown();
+                }
+            }, "tf-output-stdout");
+
+            Thread tErr = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        stderrBuf.append(line).append('\n');
+                        log.warn("[terraform-output] {}", line);
+                    }
+                } catch (IOException ignore) {
+                } finally {
+                    latch.countDown();
+                }
+            }, "tf-output-stderr");
+
+            tOut.start();
+            tErr.start();
+
+            boolean finished = p.waitFor(DEFAULT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                String msg = "Command timed out: " + display;
+                sendLogEvent(jobId, step, msg);
+                log.warn(msg);
+                return Collections.emptyMap();
+            }
+
+            latch.await(5, TimeUnit.SECONDS);
+
+            int exit = p.exitValue();
+            if (exit != 0) {
+                String merged = mergeOutErr(stdoutBuf.toString(), stderrBuf.toString());
+                String msg = "Command failed: " + display + " (exit " + exit + ")\n" + merged;
+                sendLogEvent(jobId, step, firstLine(msg));
+                log.warn(msg);
+                return Collections.emptyMap();
+            }
+
+            String json = stdoutBuf.toString();
+            if (json.isBlank()) {
+                log.warn("[TerraformExecutor] terraform output -json produced empty stdout");
+                return Collections.emptyMap();
+            }
+
+            Map<String, TerraformOutput> raw = om.readValue(
+                    json,
+                    new TypeReference<Map<String, TerraformOutput>>() {}
+            );
+
+            Map<String, Object> flat = new LinkedHashMap<>();
+            for (Map.Entry<String, TerraformOutput> e : raw.entrySet()) {
+                TerraformOutput v = e.getValue();
+                flat.put(e.getKey(), v != null ? v.value : null);
+            }
+
+            log.info("[TerraformExecutor] Parsed terraform outputs keys = {}", flat.keySet());
+            return flat;
+        } catch (Exception e) {
+            String msg = "Failed to read terraform outputs: " + e.getMessage();
+            sendLogEvent(jobId, step, firstLine(msg));
+            log.warn(msg, e);
+            return Collections.emptyMap();
+        }
+    }
+
+    private List<Map<String, Object>> extractVmDetails(Map<String, Object> tfOutputs) {
+        if (tfOutputs == null) return Collections.emptyList();
+        Object detailsObj = tfOutputs.get("vm_details");
+        if (!(detailsObj instanceof List<?> list)) {
+            return Collections.emptyList();
+        }
+
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object o : list) {
+            if (o instanceof Map<?, ?> m) {
+                Map<String, Object> casted = new LinkedHashMap<>();
+                for (Map.Entry<?, ?> e : m.entrySet()) {
+                    casted.put(String.valueOf(e.getKey()), e.getValue());
+                }
+                result.add(casted);
+            }
+        }
+        return result;
+    }
+
+    // terraform output 구조용 DTO
+    private static class TerraformOutput {
+        public Object value;
+    }
+
     // ===== 리플렉션/유틸 =====
 
     private Object safeInvoke(Object target, String method) {
@@ -840,7 +1107,8 @@ public class TerraformExecutor {
                 Method mm = target.getClass().getMethod(m);
                 Object v = mm.invoke(target);
                 if (v != null) return String.valueOf(v);
-            } catch (Exception ignore) { }
+            } catch (Exception ignore) {
+            }
         }
         return null;
     }
@@ -853,7 +1121,8 @@ public class TerraformExecutor {
                 field.setAccessible(true);
                 Object v = field.get(target);
                 if (v != null) return String.valueOf(v);
-            } catch (Exception ignore) { }
+            } catch (Exception ignore) {
+            }
         }
         return null;
     }
@@ -914,5 +1183,61 @@ public class TerraformExecutor {
             sb.append("└─ stderr ─────────────────────────────\n").append(err);
         }
         return sb.toString();
+    }
+
+    // ===== IP 선택 유틸 =====
+
+    private void addCandidatesFromList(List<String> target, Object listObj) {
+        if (!(listObj instanceof List<?> list)) return;
+        for (Object o : list) {
+            String ip = normalizeIp(asString(o));
+            if (ip != null && !target.contains(ip)) {
+                target.add(ip);
+            }
+        }
+    }
+
+    /**
+     * 여러 후보 IP 중에서 "내부망"을 우선해서 고른다.
+     * - 환경변수 INTERNAL_IP_PREFIX 가 있으면 그걸 우선 사용 (예: "172.")
+     * - 없으면 172.* -> 10.* -> 그 외 순으로 선택
+     */
+    private String choosePreferredIp(List<String> candidates) {
+        if (candidates == null || candidates.isEmpty()) return null;
+
+        List<String> filtered = new ArrayList<>();
+        for (String c : candidates) {
+            String ip = normalizeIp(c);
+            if (ip != null && !filtered.contains(ip)) {
+                filtered.add(ip);
+            }
+        }
+        if (filtered.isEmpty()) return null;
+
+        String prefixEnv = System.getenv("INTERNAL_IP_PREFIX");
+        if (prefixEnv != null && !prefixEnv.isBlank()) {
+            for (String ip : filtered) {
+                if (ip.startsWith(prefixEnv)) return ip;
+            }
+        }
+
+        // 기본 선호: 172 / 10 대역 → 내부망으로 많이 쓰이니까
+        for (String ip : filtered) {
+            if (ip.startsWith("172.")) return ip;
+        }
+        for (String ip : filtered) {
+            if (ip.startsWith("10.")) return ip;
+        }
+
+        // 그래도 없으면 첫 번째
+        return filtered.get(0);
+    }
+
+    private String normalizeIp(String ip) {
+        if (ip == null) return null;
+        ip = ip.trim();
+        if (ip.isEmpty()) return null;
+        if ("null".equalsIgnoreCase(ip) || "none".equalsIgnoreCase(ip)) return null;
+        return ip;
     }
 }

@@ -86,6 +86,10 @@ public class ProvisionResultMessage {
         private String ipAddress;
         private String osType;
 
+        // 172 대역 NIC IP 전체를 콤마로 이어붙인 문자열
+        // 예: "172.16.0.10,172.16.0.11"
+        private String nicAddresses;
+
         public InstanceInfo() {}
 
         public String getName() { return name; }
@@ -115,6 +119,14 @@ public class ProvisionResultMessage {
         public String getOsType() { return osType; }
         public void setOsType(String osType) { this.osType = osType; }
 
+        public String getNicAddresses() {
+            return nicAddresses;
+        }
+
+        public void setNicAddresses(String nicAddresses) {
+            this.nicAddresses = nicAddresses;
+        }
+
         @Override
         public String toString() {
             return "InstanceInfo{" +
@@ -127,6 +139,7 @@ public class ProvisionResultMessage {
                     ", diskGb=" + diskGb +
                     ", ipAddress='" + ipAddress + '\'' +
                     ", osType='" + osType + '\'' +
+                    ", nicAddresses='" + nicAddresses + '\'' +
                     '}';
         }
     }
