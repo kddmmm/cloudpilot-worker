@@ -2,8 +2,12 @@ package com.cloudrangers.cloudpilotworker.log;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -17,13 +21,16 @@ import java.util.Map;
 import java.util.zip.GZIPOutputStream;
 
 /**
- * 로그 로컬 저장 서비스
+ * 로그 로컬 저장 및 S3 업로드 서비스
  */
 @Service
 @Slf4j
 public class LogStorageService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Autowired(required = false)
+    private S3Client s3Client;
 
     @Value("${log.storage.base-dir:./logs}")
     private String baseDir;
@@ -34,8 +41,14 @@ public class LogStorageService {
     @Value("${log.storage.compress-raw:true}")
     private boolean compressRaw;
 
+    @Value("${log.s3.enabled:false}")
+    private boolean s3Enabled;
+
+    @Value("${log.s3.bucket:cloudpilot-refined-log}")
+    private String s3Bucket;
+
     /**
-     * 로그를 로컬 파일 시스템에 저장
+     * 로그를 로컬 파일 시스템에 저장하고 S3에 업로드
      * @param jobId 작업 ID
      * @param jobType terraform / ansible-provision / ansible-package
      * @param refinedLog 정제된 로그
@@ -66,6 +79,11 @@ public class LogStorageService {
             Files.writeString(refinedPath, jsonContent, StandardCharsets.UTF_8);
             log.info("Refined log saved (JSON): {}", refinedPath.toAbsolutePath());
 
+            // 1-1. S3에 업로드
+            if (s3Enabled && s3Client != null) {
+                uploadToS3(jobType, datePath, jobId + "-refined.json", jsonContent);
+            }
+
             // 2. 원본 로그 저장 (디버깅용)
             if (rawLog != null && !rawLog.isEmpty()) {
                 if (compressRaw) {
@@ -82,6 +100,29 @@ public class LogStorageService {
         } catch (Exception e) {
             log.error("Failed to save logs to local filesystem for jobId: {}", jobId, e);
             // 로그 저장 실패는 전체 프로세스를 중단시키지 않음
+        }
+    }
+
+    /**
+     * S3에 파일 업로드
+     */
+    private void uploadToS3(String jobType, String datePath, String fileName, String content) {
+        try {
+            String s3Key = String.format("%s/%s/%s", jobType, datePath, fileName);
+
+            PutObjectRequest putRequest = PutObjectRequest.builder()
+                    .bucket(s3Bucket)
+                    .key(s3Key)
+                    .contentType("application/json")
+                    .build();
+
+            s3Client.putObject(putRequest, RequestBody.fromString(content));
+
+            log.info("Uploaded to S3: s3://{}/{}", s3Bucket, s3Key);
+
+        } catch (Exception e) {
+            log.error("Failed to upload to S3: {}/{}/{}", jobType, datePath, fileName, e);
+            // S3 업로드 실패는 전체 프로세스를 중단시키지 않음
         }
     }
 
@@ -172,5 +213,21 @@ public class LogStorageService {
 
         Path logPath = Paths.get(baseDir, jobType, datePath, jobId + suffix);
         return logPath.toAbsolutePath().toString();
+    }
+
+    /**
+     * S3 URL 반환
+     */
+    public String getS3Url(String jobId, String jobType) {
+        if (!s3Enabled) {
+            return null;
+        }
+
+        LocalDate now = LocalDate.now();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy/MM/dd");
+        String datePath = now.format(formatter);
+
+        String s3Key = String.format("%s/%s/%s-refined.json", jobType, datePath, jobId);
+        return String.format("s3://%s/%s", s3Bucket, s3Key);
     }
 }
