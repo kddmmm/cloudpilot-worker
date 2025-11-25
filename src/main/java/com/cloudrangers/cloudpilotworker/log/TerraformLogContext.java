@@ -56,13 +56,33 @@ public class TerraformLogContext {
     }
 
     public void update(String line) {
-        // VM 이름 추출
-        if (line.contains("vmName=") || line.contains("name=")) {
-            String[] parts = line.split("name[=:]\\s*");
-            if (parts.length > 1) {
-                String potential = parts[1].split("[,\\s]")[0].replaceAll("[\"']", "");
-                if (!potential.isEmpty()) {
-                    vmName = potential;
+        // VM 이름 추출 (다양한 패턴 지원)
+        if (vmName == null || vmName.equals("Unknown")) {
+            // 패턴 1: + name = "test-vm"
+            if (line.contains("+ name") || line.contains("name =")) {
+                java.util.regex.Pattern p = java.util.regex.Pattern.compile("[+\\s]name\\s*=\\s*\"([^\"]+)\"");
+                java.util.regex.Matcher m = p.matcher(line);
+                if (m.find()) {
+                    vmName = m.group(1);
+                }
+            }
+            // 패턴 2: name = "test-vm" (따옴표 없이)
+            else if (line.matches(".*\\bname\\s*=\\s*\\S+.*")) {
+                java.util.regex.Pattern p = java.util.regex.Pattern.compile("\\bname\\s*=\\s*\"?([^\\s\",]+)\"?");
+                java.util.regex.Matcher m = p.matcher(line);
+                if (m.find()) {
+                    String name = m.group(1);
+                    if (!name.equals("var.vm_name") && !name.startsWith("${")) {
+                        vmName = name;
+                    }
+                }
+            }
+            // 패턴 3: "value": "test-vm" (output에서)
+            else if (line.contains("\"value\":")) {
+                java.util.regex.Pattern p = java.util.regex.Pattern.compile("\"value\":\\s*\"([^\"]+)\"");
+                java.util.regex.Matcher m = p.matcher(line);
+                if (m.find() && !m.group(1).matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) { // IP가 아닌 경우
+                    vmName = m.group(1);
                 }
             }
         }
