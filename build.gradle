@@ -53,7 +53,7 @@ tasks.withType(Jar).configureEach {
 }
 
 tasks.named("bootJar") {
-    archiveFileName = "cloudpilot-worker-hyunsiuuu.jar"
+    archiveFileName = "cloudpilot-worker.jar"
 }
 
 tasks.named("jar") {

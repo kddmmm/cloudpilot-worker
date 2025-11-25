@@ -2,6 +2,9 @@ package com.cloudrangers.cloudpilotworker.executor;
 
 import com.cloudrangers.cloudpilotworker.dto.ProvisionJobMessage;
 import com.cloudrangers.cloudpilotworker.dto.ProvisionResultMessage;
+import com.cloudrangers.cloudpilotworker.log.LogStorageService;
+import com.cloudrangers.cloudpilotworker.log.TerraformLogContext;
+import com.cloudrangers.cloudpilotworker.log.TerraformLogRefiner;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -55,16 +58,25 @@ public class TerraformExecutor {
     private final ResourceLoader resourceLoader;
     private final RabbitTemplate rabbitTemplate;
     private final ObjectMapper om;
+    private final TerraformLogRefiner logRefiner;
+    private final LogStorageService logStorageService;
 
     // 현재 쓰레드에서 실행 중인 jobId (로그 이벤트에 사용)
     private final ThreadLocal<String> currentJobId = new ThreadLocal<>();
+    private final ThreadLocal<StringBuilder> refinedLogBuffer = new ThreadLocal<>();
+    private final ThreadLocal<StringBuilder> rawLogBuffer = new ThreadLocal<>();
+    private final ThreadLocal<TerraformLogContext> logContext = new ThreadLocal<>();
 
     public TerraformExecutor(ResourceLoader resourceLoader,
                              RabbitTemplate rabbitTemplate,
-                             ObjectMapper objectMapper) {
+                             ObjectMapper objectMapper,
+                             TerraformLogRefiner logRefiner,
+                             LogStorageService logStorageService) {
         this.resourceLoader = resourceLoader;
         this.rabbitTemplate = rabbitTemplate;
         this.om = objectMapper.copy().enable(SerializationFeature.INDENT_OUTPUT);
+        this.logRefiner = logRefiner;
+        this.logStorageService = logStorageService;
     }
 
     // ============================================================
@@ -79,6 +91,14 @@ public class TerraformExecutor {
         long jobId = parseJobId(rawJobId);
 
         currentJobId.set(jobIdStr);
+
+        // 로그 정제를 위한 버퍼 및 컨텍스트 초기화
+        refinedLogBuffer.set(new StringBuilder());
+        rawLogBuffer.set(new StringBuilder());
+        TerraformLogContext context = new TerraformLogContext();
+        context.setJobId(jobIdStr);
+        logContext.set(context);
+
         try {
             String vmName = nvl(msg.getVmName(), "vm-" + jobId);
             String action = resolveAction(msg);
@@ -115,7 +135,20 @@ public class TerraformExecutor {
                 throw e;
             }
         } finally {
+            // 로컬 파일 시스템에 로그 저장
+            try {
+                String refinedLog = refinedLogBuffer.get().toString();
+                String rawLog = rawLogBuffer.get().toString();
+                logStorageService.saveLogsToLocal(jobIdStr, "terraform", refinedLog, rawLog);
+            } catch (Exception e) {
+                log.error("Failed to save logs to local filesystem for jobId: {}", jobIdStr, e);
+            }
+
+            // ThreadLocal 정리
             currentJobId.remove();
+            refinedLogBuffer.remove();
+            rawLogBuffer.remove();
+            logContext.remove();
         }
     }
 
@@ -487,12 +520,34 @@ public class TerraformExecutor {
             StringBuilder stderrBuf = new StringBuilder();
             CountDownLatch latch = new CountDownLatch(2);
 
+            // === 로그 정제를 위한 변수 (Thread 생성 전에 가져오기) ===
+            TerraformLogContext ctx = logContext.get();
+            StringBuilder refinedBuffer = refinedLogBuffer.get();
+            StringBuilder rawBuffer = rawLogBuffer.get();
+
             Thread tOut = new Thread(() -> {
                 try (BufferedReader br = new BufferedReader(
                         new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
+
                     while ((line = br.readLine()) != null) {
                         stdoutBuf.append(line).append('\n');
+
+                        // 원본 로그 저장
+                        if (rawBuffer != null) {
+                            rawBuffer.append(line).append('\n');
+                        }
+
+                        // 로그 정제
+                        if (ctx != null) {
+                            String refinedLine = logRefiner.refineLine(line, ctx);
+                            if (refinedLine != null && refinedBuffer != null) {
+                                refinedBuffer.append(refinedLine).append('\n');
+                                log.info("[terraform-refined] {}", refinedLine);
+                            }
+                        }
+
+                        // 기존 로그도 유지
                         log.info("[terraform] {}", line);
                         sendLogEvent(jobId, step, line);
                     }
@@ -506,8 +561,25 @@ public class TerraformExecutor {
                 try (BufferedReader br = new BufferedReader(
                         new InputStreamReader(p.getErrorStream(), StandardCharsets.UTF_8))) {
                     String line;
+
                     while ((line = br.readLine()) != null) {
                         stderrBuf.append(line).append('\n');
+
+                        // 원본 로그 저장
+                        if (rawBuffer != null) {
+                            rawBuffer.append("[stderr] ").append(line).append('\n');
+                        }
+
+                        // 로그 정제 (에러는 더 중요)
+                        if (ctx != null) {
+                            String refinedLine = logRefiner.refineLine(line, ctx);
+                            if (refinedLine != null && refinedBuffer != null) {
+                                refinedBuffer.append(refinedLine).append('\n');
+                                log.error("[terraform-refined-error] {}", refinedLine);
+                            }
+                        }
+
+                        // 기존 로그도 유지
                         log.error("[terraform] {}", line);
                         sendLogEvent(jobId, step, line);
                     }

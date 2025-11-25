@@ -1,6 +1,9 @@
 package com.cloudrangers.cloudpilotworker.executor;
 
 import com.cloudrangers.cloudpilotworker.dto.ProvisionJobMessage;
+import com.cloudrangers.cloudpilotworker.log.AnsibleLogContext;
+import com.cloudrangers.cloudpilotworker.log.AnsibleLogRefiner;
+import com.cloudrangers.cloudpilotworker.log.LogStorageService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -19,18 +22,33 @@ import java.util.concurrent.TimeUnit;
 public class AnsibleExecutor {
 
     private final ObjectMapper objectMapper;
+    private final AnsibleLogRefiner logRefiner;
+    private final LogStorageService logStorageService;
 
     // ⭐️ Ansible 서버(Worker Node)의 실제 경로 설정
     private static final String ANSIBLE_PLAYBOOK_PATH = "/etc/ansible/main_provision.yml";
     private static final String SSH_KEY_PATH = "/home/admin/.ssh/ansible_key";
     private static final String REMOTE_USER = "admin";
 
-    public AnsibleExecutor(ObjectMapper objectMapper) {
+    public AnsibleExecutor(ObjectMapper objectMapper,
+                           AnsibleLogRefiner logRefiner,
+                           LogStorageService logStorageService) {
         this.objectMapper = objectMapper;
+        this.logRefiner = logRefiner;
+        this.logStorageService = logStorageService;
     }
 
     public void execute(String targetIp, ProvisionJobMessage msg) {
         log.info("🚀 [Ansible] Starting Provisioning for IP: {}", targetIp);
+
+        // 로그 정제를 위한 버퍼 및 컨텍스트 초기화
+        StringBuilder refinedLog = new StringBuilder();
+        StringBuilder rawLog = new StringBuilder();
+        AnsibleLogContext context = new AnsibleLogContext();
+
+        // JobId 추출 (로그 저장용)
+        String jobId = msg.getJobId() != null ? String.valueOf(msg.getJobId()) :
+                String.valueOf(System.currentTimeMillis());
 
         try {
             // 1. 설치할 패키지 목록 추출
@@ -69,11 +87,22 @@ public class AnsibleExecutor {
 
             Process process = pb.start();
 
-            // 5. 로그 실시간 출력 (Worker 로그 파일에 기록됨)
+            // 5. 로그 실시간 출력 및 정제
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
+                    // 원본 로그 저장
+                    rawLog.append(line).append('\n');
+
+                    // 로그 정제
+                    String refinedLine = logRefiner.refineLine(line, context);
+                    if (refinedLine != null) {
+                        refinedLog.append(refinedLine).append('\n');
+                        log.info("[Ansible-refined] {}", refinedLine);
+                    }
+
+                    // 기존 로그도 유지
                     log.info("[Ansible-Log] {}", line);
                 }
             }
@@ -97,6 +126,14 @@ public class AnsibleExecutor {
             // Ansible 실패가 전체 프로세스를 중단시켜야 한다면 throw e;
             // 여기서는 throw를 해서 WorkerListener에서 로깅 후 처리하도록 함
             throw new RuntimeException("Ansible Execution Failed", e);
+        } finally {
+            // 로컬 파일 시스템에 로그 저장
+            try {
+                logStorageService.saveLogsToLocal(jobId, "ansible-provision",
+                        refinedLog.toString(), rawLog.toString());
+            } catch (Exception e) {
+                log.error("Failed to save Ansible logs to local filesystem for jobId: {}", jobId, e);
+            }
         }
     }
 }
