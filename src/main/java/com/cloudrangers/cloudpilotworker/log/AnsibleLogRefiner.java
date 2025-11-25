@@ -32,12 +32,25 @@ public class AnsibleLogRefiner {
             return captureErrorContext(trimmed, context);
         }
 
+        // Ansible 실행 에러 (ERROR!로 시작)
+        if (trimmed.startsWith("ERROR!")) {
+            context.setInError(true);
+            context.setErrorType(AnsibleErrorType.SYNTAX_ERROR);
+
+            StringBuilder error = new StringBuilder("\n❌ ============ ANSIBLE ERROR ============\n");
+            error.append("    ❌ ").append(maskSensitiveInfo(trimmed)).append("\n");
+
+            return error.toString();
+        }
+
+        // Task 실패
         if (trimmed.startsWith("failed:") || trimmed.contains("fatal:")) {
             context.setInError(true);
             context.setErrorHost(extractHost(trimmed));
             return "\n❌ ============ TASK FAILED ============";
         }
 
+        // Host 연결 불가
         if (trimmed.contains("unreachable:")) {
             return formatUnreachableError(trimmed, context);
         }
@@ -155,13 +168,34 @@ public class AnsibleLogRefiner {
     private String captureErrorContext(String line, AnsibleLogContext context) {
         StringBuilder error = new StringBuilder();
 
+        // 에러 종료 조건: 새로운 PLAY 또는 TASK 시작
+        if (line.startsWith("PLAY [") || line.startsWith("TASK [")) {
+            context.setInError(false);
+            context.setInErrorJson(false);
+            return buildErrorSummary(context);
+        }
+
+        // 빈 라인 연속 2개면 종료
+        if (line.isEmpty()) {
+            context.incrementDebugLines(); // 카운터 용도로 재사용
+            if (context.getDebugLines() >= 2) {
+                context.setInError(false);
+                context.setInErrorJson(false);
+                context.resetDebugLines();
+                return buildErrorSummary(context);
+            }
+            return null;
+        } else {
+            context.resetDebugLines();
+        }
+
         // 에러 JSON 시작
         if (line.startsWith("{") || line.equals("=>")) {
             context.setInErrorJson(true);
             return null;
         }
 
-        // 에러 메시지 추출
+        // JSON 에러 메시지 추출
         if (line.contains("\"msg\":")) {
             String msg = extractJsonValue(line, "msg");
             error.append(String.format("\n📛 Task: %s\n", context.getCurrentTask()));
@@ -194,11 +228,33 @@ public class AnsibleLogRefiner {
             return String.format("  └─ command: %s\n", maskSensitiveInCommand(cmd));
         }
 
-        // 에러 종료
-        if (line.isEmpty() && context.isInErrorJson()) {
-            context.setInError(false);
-            context.setInErrorJson(false);
-            return buildErrorSummary(context);
+        // 일반 텍스트 에러 컨텍스트 (ERROR! 이후의 라인들)
+        // 빈 라인 2개가 나올 때까지 모든 라인 수집 (단, 불필요한 것만 필터링)
+
+        // 완전히 스킵할 라인 (노이즈)
+        if (line.matches("^=+$") || line.matches("^-+$")) {
+            return null; // 구분선
+        }
+
+        // 중요한 키워드를 포함한 라인은 강조
+        if (line.contains("appears to be") || line.contains("offending line")) {
+            return "\n    " + maskSensitiveInfo(line) + "\n";
+        }
+
+        if (line.contains("^ here") || line.contains("^~~~")) {
+            return "    " + line + " ← HERE\n";
+        }
+
+        // 나머지는 모두 수집 (들여쓰기 추가)
+        if (!line.isEmpty()) {
+            // 이미 들여쓰기가 있는 라인
+            if (line.startsWith("  ") || line.startsWith("\t")) {
+                return "    " + maskSensitiveInfo(line.trim()) + "\n";
+            }
+            // 들여쓰기 없는 라인 (주석, YAML 구조 등)
+            else {
+                return "    " + maskSensitiveInfo(line) + "\n";
+            }
         }
 
         return null;
@@ -325,6 +381,19 @@ public class AnsibleLogRefiner {
 
     private String maskIp(String ip) {
         return IP_PATTERN.matcher(ip).replaceAll("***IP***");
+    }
+
+    private String maskSensitiveInfo(String line) {
+        // IP 마스킹
+        line = IP_PATTERN.matcher(line).replaceAll("***IP***");
+
+        // 비밀번호 마스킹
+        line = line.replaceAll("(password|passwd|pwd)\\s*[:=]\\s*\\S+", "$1: ***");
+
+        // 파일 경로 간소화 (전체 경로 표시는 보안상 좋지 않음)
+        line = line.replaceAll("/etc/ansible/roles/([^/]+)/.*", "/etc/ansible/roles/$1/...");
+
+        return line;
     }
 
     private String maskSensitiveInCommand(String cmd) {

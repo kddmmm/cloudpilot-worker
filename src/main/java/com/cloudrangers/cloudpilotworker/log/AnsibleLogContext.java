@@ -25,6 +25,10 @@ public class AnsibleLogContext {
         debugLines++;
     }
 
+    public void resetDebugLines() {
+        debugLines = 0;
+    }
+
     public void update(String line) {
         if (line.startsWith("PLAY [")) {
             currentPlay = extractBracketContent(line);
