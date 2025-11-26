@@ -1,24 +1,22 @@
 package com.cloudrangers.cloudpilotworker.config;
 
-import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.type.TypeFactory;
 import org.springframework.amqp.core.*;
+import org.springframework.amqp.rabbit.annotation.EnableRabbit;
 import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
-import org.springframework.amqp.support.converter.DefaultJackson2JavaTypeMapper;
-import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.amqp.support.converter.SimpleMessageConverter;
+import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.amqp.SimpleRabbitListenerContainerFactoryConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.messaging.handler.annotation.support.DefaultMessageHandlerMethodFactory;
-import org.springframework.messaging.handler.annotation.support.MessageHandlerMethodFactory;
 
 @Configuration
+@EnableRabbit
 public class RabbitConfig {
 
     // ===== 이름/키 =====
@@ -36,12 +34,24 @@ public class RabbitConfig {
     // ===== Exchange =====
     @Bean("provisionExchange")
     public TopicExchange provisionExchange() {
-        return ExchangeBuilder.topicExchange(provisionExchangeName).durable(true).build();
+        return ExchangeBuilder.topicExchange(provisionExchangeName)
+                .durable(true)
+                .build();
     }
 
     @Bean("resultExchange")
     public TopicExchange resultExchange() {
-        return ExchangeBuilder.topicExchange(resultExchangeName).durable(true).build();
+        return ExchangeBuilder.topicExchange(resultExchangeName)
+                .durable(true)
+                .build();
+    }
+
+    // DLX도 실제로 하나 만들어 두는 게 안전
+    @Bean("dlxExchange")
+    public TopicExchange dlxExchange() {
+        return ExchangeBuilder.topicExchange(dlxExchangeName)
+                .durable(true)
+                .build();
     }
 
     // ===== Queue =====
@@ -63,61 +73,75 @@ public class RabbitConfig {
     public Binding provisionBinding(
             @Qualifier("provisionQueue") Queue queue,
             @Qualifier("provisionExchange") TopicExchange exchange) {
-        return BindingBuilder.bind(queue).to(exchange).with(provisionRoutingKey);
+
+        return BindingBuilder.bind(queue)
+                .to(exchange)
+                .with(provisionRoutingKey);
     }
 
     @Bean
     public Binding resultBinding(
             @Qualifier("resultQueue") Queue queue,
             @Qualifier("resultExchange") TopicExchange exchange) {
-        return BindingBuilder.bind(queue).to(exchange).with(resultRoutingKey);
+
+        return BindingBuilder.bind(queue)
+                .to(exchange)
+                .with(resultRoutingKey);
     }
 
-    // ===== Converter (⭐️ TypeId 완전히 무시) =====
+    // ============================
+    // 1) RabbitTemplate → 결과 전송용 (JSON 사용)
+    // ============================
     @Bean
-    public MessageConverter messageConverter(ObjectMapper objectMapper) {
-        Jackson2JsonMessageConverter converter = new Jackson2JsonMessageConverter(objectMapper);
+    public RabbitTemplate rabbitTemplate(ConnectionFactory connectionFactory,
+                                         ObjectMapper objectMapper) {
 
-        // ⭐️ 커스텀 TypeMapper: __TypeId__ 헤더를 완전히 무시
-        DefaultJackson2JavaTypeMapper typeMapper = new DefaultJackson2JavaTypeMapper() {
-            @Override
-            public JavaType toJavaType(org.springframework.amqp.core.MessageProperties properties) {
-                // __TypeId__ 헤더를 무시하고 기본 타입(Object) 반환
-                return TypeFactory.defaultInstance().constructType(Object.class);
-            }
-        };
+        RabbitTemplate template = new RabbitTemplate(connectionFactory);
 
-        converter.setJavaTypeMapper(typeMapper);
-        return converter;
+        // 결과 메시지는 JSON으로 보내고 싶으니까 여기서는 Jackson 사용
+        Jackson2JsonMessageConverter converter =
+                new Jackson2JsonMessageConverter(objectMapper);
+        template.setMessageConverter(converter);
+
+        return template;
     }
 
-    // ===== Message Handler Method Factory (⭐️ 변환 비활성화) =====
-    @Bean
-    public MessageHandlerMethodFactory messageHandlerMethodFactory() {
-        DefaultMessageHandlerMethodFactory factory = new DefaultMessageHandlerMethodFactory();
-        // 메시지 변환을 건너뛰고 원시 Message를 전달
-        return factory;
+    // ============================
+    // 2) Listener 전용 컨버터 → raw payload만 받도록
+    // ============================
+    @Bean("workerListenerMessageConverter")
+    public MessageConverter workerListenerMessageConverter() {
+        // 🔥 중요: Jackson 말고 SimpleMessageConverter 사용
+        // → __TypeId__ 헤더를 전혀 보지 않음
+        // → payload 는 byte[] / String 으로만 다룸
+        return new SimpleMessageConverter();
     }
 
-    // ===== Listener Factory =====
-    @Bean
+    // ============================
+    // 3) Listener Container Factory
+    // ============================
+    @Bean("rabbitListenerContainerFactory")
     public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
-            SimpleRabbitListenerContainerFactoryConfigurer configurer,
             ConnectionFactory connectionFactory,
-            MessageConverter messageConverter
+            @Qualifier("workerListenerMessageConverter")
+            MessageConverter listenerMessageConverter
     ) {
-        SimpleRabbitListenerContainerFactory f = new SimpleRabbitListenerContainerFactory();
-        configurer.configure(f, connectionFactory);
+        SimpleRabbitListenerContainerFactory factory =
+                new SimpleRabbitListenerContainerFactory();
 
-        // ⭐️ 커스텀 MessageConverter 설정
-        f.setMessageConverter(messageConverter);
+        factory.setConnectionFactory(connectionFactory);
+        factory.setMessageConverter(listenerMessageConverter);
 
-        // 실패 시 재큐잉 금지 → DLX로 바로 이동
-        f.setDefaultRequeueRejected(false);
-        // 큐가 잠시 없어도 기동
-        f.setMissingQueuesFatal(false);
+        // 실패 시 재큐잉 금지 → DLX / drop
+        factory.setDefaultRequeueRejected(false);
+        // 큐 없다고 애플리케이션 죽지 않게
+        factory.setMissingQueuesFatal(false);
 
-        return f;
+        // 필요하면 동시 소비자 수 조절
+        // factory.setConcurrentConsumers(1);
+        // factory.setMaxConcurrentConsumers(1);
+
+        return factory;
     }
 
     // ===== Admin (자동 선언 ON) =====

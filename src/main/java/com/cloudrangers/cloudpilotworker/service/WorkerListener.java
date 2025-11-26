@@ -187,37 +187,37 @@ public class WorkerListener {
      */
     private boolean isFinalAttempt(Message message) {
         try {
-            // x-death 헤더 확인 (재시도 횟수 정보)
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> xDeathHeader =
                     (List<Map<String, Object>>) message.getMessageProperties().getHeaders().get("x-death");
 
+            // 1) DLX/Retry 큐를 쓰는 경우: x-death 기반으로 최종 시도 판단
             if (xDeathHeader != null && !xDeathHeader.isEmpty()) {
                 Map<String, Object> death = xDeathHeader.get(0);
                 Object countObj = death.get("count");
 
-                if (countObj instanceof Long) {
-                    long count = (Long) countObj;
-                    // count가 maxAttempts-1이면 마지막 시도 (0부터 시작)
-                    boolean isFinal = count >= (maxAttempts - 1);
-                    log.debug("x-death count: {}, maxAttempts: {}, isFinal: {}", count, maxAttempts, isFinal);
-                    return isFinal;
-                } else if (countObj instanceof Integer) {
-                    int count = (Integer) countObj;
-                    boolean isFinal = count >= (maxAttempts - 1);
-                    log.debug("x-death count: {}, maxAttempts: {}, isFinal: {}", count, maxAttempts, isFinal);
-                    return isFinal;
+                long count;
+                if (countObj instanceof Number n) {
+                    count = n.longValue();
+                } else {
+                    count = Long.parseLong(String.valueOf(countObj));
                 }
+
+                boolean isFinal = count >= (maxAttempts - 1);
+                log.debug("x-death count: {}, maxAttempts: {}, isFinal: {}", count, maxAttempts, isFinal);
+                return isFinal;
             }
 
-            // x-death가 없으면 첫 시도
-            log.debug("No x-death header found - first attempt");
-            return false;
+            // 2) x-death가 없는 경우
+            //    → 지금 구조에선 재시도/재전송이 없으므로,
+            //       이 시도가 곧 "첫 시도이자 마지막 시도"라고 판단
+            log.debug("No x-death header found - treating as FINAL attempt (no retry queue configured)");
+            return true;
 
         } catch (Exception e) {
+            // 혹시 에러가 나도, 로그는 남는 게 낫다 → 보수적으로 true
             log.warn("Failed to check if final attempt: {}", e.getMessage());
-            // 확인 실패 시 안전하게 false 반환 (첫 시도로 간주)
-            return false;
+            return true;
         }
     }
 
