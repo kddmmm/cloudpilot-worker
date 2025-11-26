@@ -38,7 +38,7 @@ public class AnsibleExecutor {
         this.logStorageService = logStorageService;
     }
 
-    public void execute(String targetIp, ProvisionJobMessage msg) {
+    public void execute(String targetIp, ProvisionJobMessage msg, boolean isFinalAttempt) {  // ⭐️ 파라미터 추가
         log.info("🚀 [Ansible] Starting Provisioning for IP: {}", targetIp);
 
         // 로그 정제를 위한 버퍼 및 컨텍스트 초기화
@@ -57,32 +57,29 @@ public class AnsibleExecutor {
                 packages = msg.getProperties().getPackages();
             }
 
-            // 2. Extra Vars 생성 ('{"target_packages": ["nginx", "vscode"]}')
+            // 2. Extra Vars 생성
             Map<String, Object> extraVars = new HashMap<>();
             extraVars.put("target_packages", packages);
             String extraVarsJson = objectMapper.writeValueAsString(extraVars);
 
             // 3. 명령어 조립
-            // 명령어 예시: ansible-playbook -i "172.16.5.123," --private-key ... -u admin -e '...' /etc/ansible/main_provision.yml
             List<String> command = new ArrayList<>();
             command.add("ansible-playbook");
             command.add("-i");
-            command.add(targetIp + ",");   // ⭐️ 콤마 필수 (Inventory File 없이 실행)
+            command.add(targetIp + ",");
             command.add("--private-key");
             command.add(SSH_KEY_PATH);
             command.add("-u");
             command.add(REMOTE_USER);
             command.add("-e");
-            command.add(extraVarsJson);    // JSON 변수 주입
+            command.add(extraVarsJson);
             command.add(ANSIBLE_PLAYBOOK_PATH);
 
             log.info("[Ansible] Command: {}", String.join(" ", command));
 
             // 4. 프로세스 실행
             ProcessBuilder pb = new ProcessBuilder(command);
-            pb.redirectErrorStream(true); // 에러 출력을 표준 출력으로 합침
-
-            // 환경변수 설정 (호스트 키 검사 무시 등 필요시 추가)
+            pb.redirectErrorStream(true);
             pb.environment().put("ANSIBLE_HOST_KEY_CHECKING", "False");
 
             Process process = pb.start();
@@ -92,22 +89,19 @@ public class AnsibleExecutor {
                     new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    // 원본 로그 저장
                     rawLog.append(line).append('\n');
 
-                    // 로그 정제
                     String refinedLine = logRefiner.refineLine(line, context);
                     if (refinedLine != null) {
                         refinedLog.append(refinedLine).append('\n');
                         log.info("[Ansible-refined] {}", refinedLine);
                     }
 
-                    // 기존 로그도 유지
                     log.info("[Ansible-Log] {}", line);
                 }
             }
 
-            // 6. 종료 대기 (최대 20분)
+            // 6. 종료 대기
             boolean finished = process.waitFor(20, TimeUnit.MINUTES);
             if (!finished) {
                 process.destroyForcibly();
@@ -123,14 +117,12 @@ public class AnsibleExecutor {
 
         } catch (Exception e) {
             log.error("❌ [Ansible] Execution Error", e);
-            // Ansible 실패가 전체 프로세스를 중단시켜야 한다면 throw e;
-            // 여기서는 throw를 해서 WorkerListener에서 로깅 후 처리하도록 함
             throw new RuntimeException("Ansible Execution Failed", e);
         } finally {
-            // 로컬 파일 시스템에 로그 저장
+            // ⭐️ 마지막 시도일 때만 refined 로그 저장
             try {
                 logStorageService.saveLogsToLocal(jobId, "ansible-provision",
-                        refinedLog.toString(), rawLog.toString());
+                        refinedLog.toString(), rawLog.toString(), isFinalAttempt);
             } catch (Exception e) {
                 log.error("Failed to save Ansible logs to local filesystem for jobId: {}", jobId, e);
             }

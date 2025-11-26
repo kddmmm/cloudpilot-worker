@@ -14,10 +14,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.zip.GZIPOutputStream;
@@ -49,14 +47,18 @@ public class LogStorageService {
     @Value("${log.s3.bucket:cloudpilot-refined-log}")
     private String s3Bucket;
 
+    @Value("${log.s3.raw-bucket:cloudpilot-raw-log}")
+    private String s3RawBucket;
+
     /**
      * 로그를 로컬 파일 시스템에 저장하고 S3에 업로드
      * @param jobId 작업 ID
      * @param jobType terraform / ansible-provision / ansible-package
      * @param refinedLog 정제된 로그
      * @param rawLog 원본 로그
+     * @param isFinalAttempt 마지막 시도 여부 (true: 3번째 시도)
      */
-    public void saveLogsToLocal(String jobId, String jobType, String refinedLog, String rawLog) {
+    public void saveLogsToLocal(String jobId, String jobType, String refinedLog, String rawLog, boolean isFinalAttempt) {
         if (!storageEnabled) {
             log.debug("Log storage is disabled, skipping file save");
             return;
@@ -67,50 +69,68 @@ public class LogStorageService {
             DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH:mm:ss");
             String timestamp = now.format(dateTimeFormatter);
 
-            // 디렉토리 경로 생성 (날짜 디렉토리 없음)
+            // 디렉토리 경로 생성
             Path logDir = Paths.get(baseDir, jobType);
             Files.createDirectories(logDir);
 
-            // 파일명: {날짜}_{시간}_{jobId}-refined.json
             String refinedFileName = String.format("%s_%s-refined.json", timestamp, jobId);
             String rawFileName = String.format("%s_%s-raw.log.gz", timestamp, jobId);
 
-            // 1. 정제된 로그를 JSON 형식으로 저장 (AI용)
-            Path refinedPath = logDir.resolve(refinedFileName);
-            Map<String, String> logJson = new HashMap<>();
-            logJson.put("log", refinedLog);
+            // ISO 8601 타임스탬프
+            String isoTimestamp = java.time.Instant.now().toString();
 
-            String jsonContent = objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsString(logJson);
-            Files.writeString(refinedPath, jsonContent, StandardCharsets.UTF_8);
-            log.info("Refined log saved (JSON): {}", refinedPath.toAbsolutePath());
+            // 1. 정제된 로그는 마지막 시도일 때만 생성 (삭제 로직 없음)
+            if (isFinalAttempt) {
+                log.info("Final attempt - saving refined log for jobId: {}", jobId);
 
-            // 1-1. S3에 업로드
-            if (s3Enabled && s3Client != null) {
-                uploadToS3(jobType, refinedFileName, jsonContent);
+                Path refinedPath = logDir.resolve(refinedFileName);
+                Map<String, Object> logJson = new HashMap<>();
+                logJson.put("jobId", jobId);
+                logJson.put("timestamp", isoTimestamp);
+                logJson.put("jobType", jobType);
+                logJson.put("log", refinedLog);
+
+                String jsonContent = objectMapper.writerWithDefaultPrettyPrinter()
+                        .writeValueAsString(logJson);
+                Files.writeString(refinedPath, jsonContent, StandardCharsets.UTF_8);
+                log.info("Refined log saved (JSON): {}", refinedPath.toAbsolutePath());
+
+                // S3에 업로드
+                if (s3Enabled && s3Client != null) {
+                    uploadToS3(jobType, refinedFileName, jsonContent);
+                }
+            } else {
+                log.debug("Not final attempt - skipping refined log for jobId: {}", jobId);
             }
 
-            // 2. 원본 로그 저장 (디버깅용)
+            // 2. 원본 로그는 매번 저장 (디버깅용)
             if (rawLog != null && !rawLog.isEmpty()) {
                 if (compressRaw) {
                     Path rawPath = logDir.resolve(rawFileName);
                     saveCompressed(rawPath, rawLog);
                     log.info("Raw log saved (compressed): {}", rawPath.toAbsolutePath());
+
+                    if (s3Enabled && s3Client != null) {
+                        uploadRawToS3(jobType, rawFileName, rawPath);
+                    }
                 } else {
                     Path rawPath = logDir.resolve(rawFileName.replace(".gz", ""));
                     Files.writeString(rawPath, rawLog, StandardCharsets.UTF_8);
                     log.info("Raw log saved: {}", rawPath.toAbsolutePath());
+
+                    if (s3Enabled && s3Client != null) {
+                        uploadRawToS3(jobType, rawFileName.replace(".gz", ""), rawPath);
+                    }
                 }
             }
 
         } catch (Exception e) {
             log.error("Failed to save logs to local filesystem for jobId: {}", jobId, e);
-            // 로그 저장 실패는 전체 프로세스를 중단시키지 않음
         }
     }
 
     /**
-     * S3에 파일 업로드
+     * S3에 파일 업로드 (정제된 로그)
      */
     private void uploadToS3(String jobType, String fileName, String content) {
         try {
@@ -128,7 +148,28 @@ public class LogStorageService {
 
         } catch (Exception e) {
             log.error("Failed to upload to S3: {}/{}", jobType, fileName, e);
-            // S3 업로드 실패는 전체 프로세스를 중단시키지 않음
+        }
+    }
+
+    /**
+     * S3에 원본 로그 파일 업로드
+     */
+    private void uploadRawToS3(String jobType, String fileName, Path filePath) {
+        try {
+            String s3Key = String.format("%s/%s", jobType, fileName);
+
+            PutObjectRequest putRequest = PutObjectRequest.builder()
+                    .bucket(s3RawBucket)
+                    .key(s3Key)
+                    .contentType(fileName.endsWith(".gz") ? "application/gzip" : "text/plain")
+                    .build();
+
+            s3Client.putObject(putRequest, RequestBody.fromFile(filePath));
+
+            log.info("Uploaded raw log to S3: s3://{}/{}", s3RawBucket, s3Key);
+
+        } catch (Exception e) {
+            log.error("Failed to upload raw log to S3: {}/{}", jobType, fileName, e);
         }
     }
 
@@ -144,7 +185,6 @@ public class LogStorageService {
 
     /**
      * 로컬에서 정제된 로그 읽기 (AI 전달용)
-     * @return JSON 파일에서 "log" 키의 값을 반환
      */
     public String getRefinedLog(String jobId, String jobType) {
         if (!storageEnabled) {
@@ -160,20 +200,16 @@ public class LogStorageService {
                 return null;
             }
 
-            // 파일명 패턴: *_{jobId}-refined.json
-            String pattern = "*_" + jobId + "-refined.json";
-
-            // 가장 최근 파일 찾기
             Path refinedPath = Files.list(logDir)
                     .filter(path -> path.getFileName().toString().endsWith("_" + jobId + "-refined.json"))
-                    .max(Comparator.comparing(path -> path.getFileName().toString()))
+                    .max((p1, p2) -> p1.getFileName().toString().compareTo(p2.getFileName().toString()))
                     .orElse(null);
 
             if (refinedPath != null && Files.exists(refinedPath)) {
                 String jsonContent = Files.readString(refinedPath, StandardCharsets.UTF_8);
                 @SuppressWarnings("unchecked")
-                Map<String, String> logJson = objectMapper.readValue(jsonContent, Map.class);
-                return logJson.get("log");
+                Map<String, Object> logJson = objectMapper.readValue(jsonContent, Map.class);
+                return (String) logJson.get("log");
             } else {
                 log.warn("Refined log not found for jobId: {} in {}", jobId, logDir);
                 return null;
@@ -186,7 +222,7 @@ public class LogStorageService {
     }
 
     /**
-     * JSON 형식의 로그 파일 전체를 읽기 (JSON 그대로)
+     * JSON 형식의 로그 파일 전체를 읽기
      */
     public String getRefinedLogJson(String jobId, String jobType) {
         if (!storageEnabled) {
@@ -202,10 +238,9 @@ public class LogStorageService {
                 return null;
             }
 
-            // 가장 최근 파일 찾기
             Path refinedPath = Files.list(logDir)
                     .filter(path -> path.getFileName().toString().endsWith("_" + jobId + "-refined.json"))
-                    .max(Comparator.comparing(path -> path.getFileName().toString()))
+                    .max((p1, p2) -> p1.getFileName().toString().compareTo(p2.getFileName().toString()))
                     .orElse(null);
 
             if (refinedPath != null && Files.exists(refinedPath)) {
@@ -222,7 +257,7 @@ public class LogStorageService {
     }
 
     /**
-     * 로그 파일 경로 반환 (외부에서 직접 접근용)
+     * 로그 파일 경로 반환
      */
     public String getLogPath(String jobId, String jobType, String suffix) {
         try {
@@ -232,7 +267,6 @@ public class LogStorageService {
                 return null;
             }
 
-            // 파일명 패턴 매칭
             String pattern = "_" + jobId + suffix;
             if (suffix.equals("-refined.log")) {
                 pattern = "_" + jobId + "-refined.json";
@@ -241,7 +275,7 @@ public class LogStorageService {
             final String finalPattern = pattern;
             Path logPath = Files.list(logDir)
                     .filter(path -> path.getFileName().toString().endsWith(finalPattern))
-                    .max(Comparator.comparing(path -> path.getFileName().toString()))
+                    .max((p1, p2) -> p1.getFileName().toString().compareTo(p2.getFileName().toString()))
                     .orElse(null);
 
             return logPath != null ? logPath.toAbsolutePath().toString() : null;
@@ -253,14 +287,13 @@ public class LogStorageService {
     }
 
     /**
-     * S3 URL 반환
+     * S3 URL 반환 (정제된 로그)
      */
     public String getS3Url(String jobId, String jobType) {
         if (!s3Enabled) {
             return null;
         }
 
-        // 로컬에서 파일명 찾기
         String localPath = getLogPath(jobId, jobType, "-refined.json");
         if (localPath == null) {
             return null;
@@ -271,5 +304,25 @@ public class LogStorageService {
 
         String s3Key = String.format("%s/%s", jobType, fileName);
         return String.format("s3://%s/%s", s3Bucket, s3Key);
+    }
+
+    /**
+     * Raw 로그 S3 URL 반환
+     */
+    public String getRawS3Url(String jobId, String jobType) {
+        if (!s3Enabled) {
+            return null;
+        }
+
+        String localPath = getLogPath(jobId, jobType, "-raw.log.gz");
+        if (localPath == null) {
+            return null;
+        }
+
+        Path path = Paths.get(localPath);
+        String fileName = path.getFileName().toString();
+
+        String s3Key = String.format("%s/%s", jobType, fileName);
+        return String.format("s3://%s/%s", s3RawBucket, s3Key);
     }
 }

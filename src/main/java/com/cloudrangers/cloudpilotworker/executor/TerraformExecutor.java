@@ -83,7 +83,7 @@ public class TerraformExecutor {
     // 1. 외부 진입점 (Execute)
     // ============================================================
 
-    public String execute(ProvisionJobMessage msg) {
+    public String execute(ProvisionJobMessage msg, boolean isFinalAttempt) {  // ⭐️ 파라미터 추가
         Objects.requireNonNull(msg, "ProvisionJobMessage must not be null");
 
         Object rawJobId = safeInvoke(msg, "getJobId");
@@ -135,11 +135,11 @@ public class TerraformExecutor {
                 throw e;
             }
         } finally {
-            // 로컬 파일 시스템에 로그 저장
+            // ⭐️ 마지막 시도일 때만 refined 로그 저장
             try {
                 String refinedLog = refinedLogBuffer.get().toString();
                 String rawLog = rawLogBuffer.get().toString();
-                logStorageService.saveLogsToLocal(jobIdStr, "terraform", refinedLog, rawLog);
+                logStorageService.saveLogsToLocal(jobIdStr, "terraform", refinedLog, rawLog, isFinalAttempt);
             } catch (Exception e) {
                 log.error("Failed to save logs to local filesystem for jobId: {}", jobIdStr, e);
             }
