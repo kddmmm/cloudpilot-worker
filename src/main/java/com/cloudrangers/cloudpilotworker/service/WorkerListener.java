@@ -35,6 +35,7 @@ public class WorkerListener {
     @Value("${worker.id}") private String workerId;
     @Value("${rabbitmq.exchange.result.name}") private String resultExchange;
     @Value("${rabbitmq.routing-key.result}")   private String resultRoutingKey;
+    @Value("${spring.rabbitmq.listener.simple.retry.max-attempts:3}") private int maxAttempts;
 
     public WorkerListener(RabbitTemplate rabbitTemplate,
                           TerraformExecutor terraformExecutor,
@@ -50,11 +51,19 @@ public class WorkerListener {
             queues = "${rabbitmq.queue.provision.name}",
             containerFactory = "rabbitListenerContainerFactory"
     )
-    public void handleProvision(Object raw,
+    public void handleProvision(Message message,
                                 @Header(name = AmqpHeaders.CORRELATION_ID, required = false) Object correlationIdRaw) {
+
+        // ⭐️ 현재 시도 횟수 확인 (x-death 헤더에서)
+        boolean isFinalAttempt = isFinalAttempt(message);
+
+        log.info("[Worker:{}] Message received. isFinalAttempt={}", workerId, isFinalAttempt);
+
+        // ✅ message 전체를 넘김 (byte[] 추출 삭제)
         ProvisionJobMessage msg = null;
+
         try {
-            msg = coerceToProvisionJobMessage(raw);
+            msg = coerceToProvisionJobMessage(message);  // ✅ message 전체 전달
 
             final String jobId   = msg.getJobId();
             final String corrIn  = toCorrString(correlationIdRaw) != null ? toCorrString(correlationIdRaw) : jobId;
@@ -62,7 +71,7 @@ public class WorkerListener {
             final String jobIdHeader = jobId;
 
             log.info("[Worker:{}] ===== Received Provision Job =====", workerId);
-            log.info("[Worker:{}] JobID: {}, CorrelationID: {}", workerId, jobId, corrIn);
+            log.info("[Worker:{}] JobID: {}, CorrelationID: {}, isFinalAttempt: {}", workerId, jobId, corrIn, isFinalAttempt);
             log.info("[Worker:{}] VM Config: name={}, count={}, cpu={}, mem={}GB, disk={}GB",
                     workerId, msg.getVmName(), msg.getVmCount(), msg.getCpuCores(), msg.getMemoryGb(), msg.getDiskGb());
 
@@ -71,9 +80,9 @@ public class WorkerListener {
             }
 
             // ============================================================
-            // 1. Terraform 실행 (VM 생성)
+            // 1. Terraform 실행 (VM 생성) - ⭐️ isFinalAttempt 전달
             // ============================================================
-            String vmId = terraformExecutor.execute(msg);
+            String vmId = terraformExecutor.execute(msg, isFinalAttempt);
             log.info("[Worker:{}] Terraform execution finished. VM ID: {}", workerId, vmId);
 
             // ============================================================
@@ -83,15 +92,14 @@ public class WorkerListener {
             log.info("[Worker:{}] Final selected IP from Terraform: {}", workerId, extractedIp);
 
             // ============================================================
-            // 3. Ansible 실행 (수정됨: BackendClient 제거, Terraform IP 사용)
+            // 3. Ansible 실행 - ⭐️ isFinalAttempt 전달
             // ============================================================
-            String targetIp = extractedIp; // ⭐️ 무조건 Terraform에서 필터링한 172. 대역 IP 사용
+            String targetIp = extractedIp;
 
             if (targetIp != null && !targetIp.isBlank() && !"null".equalsIgnoreCase(targetIp)) {
                 try {
-                    // Ansible 실행 (172 IP 사용)
                     log.info("[Worker:{}] Starting Ansible provisioning for IP: {}", workerId, targetIp);
-                    ansibleExecutor.execute(targetIp, msg);
+                    ansibleExecutor.execute(targetIp, msg, isFinalAttempt);
                     log.info("[Worker:{}] Ansible provisioning completed successfully.", workerId);
 
                 } catch (Exception e) {
@@ -129,7 +137,6 @@ public class WorkerListener {
                 inst.setMemoryGb(msg.getMemoryGb());
                 inst.setDiskGb(msg.getDiskGb());
 
-                // 최종 IP 설정
                 inst.setIpAddress(targetIp);
 
                 if (msg.getOs() != null && msg.getOs().getFamily() != null) {
@@ -151,7 +158,6 @@ public class WorkerListener {
             log.info("[Worker:{}] ✓ Job completed. jobId={}, IP={}", workerId, jobId, targetIp);
 
         } catch (Exception e) {
-            // 에러 처리 로직
             final String fallbackCorr =
                     (msg != null && msg.getJobId() != null && !msg.getJobId().isBlank())
                             ? msg.getJobId()
@@ -172,6 +178,46 @@ public class WorkerListener {
             });
 
             throw new AmqpRejectAndDontRequeueException("Listener failed", e);
+        }
+    }
+
+    /**
+     * ⭐️ 마지막 시도인지 확인
+     * RabbitMQ 재시도 메커니즘에서 현재 시도 횟수를 확인
+     */
+    private boolean isFinalAttempt(Message message) {
+        try {
+            // x-death 헤더 확인 (재시도 횟수 정보)
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> xDeathHeader =
+                    (List<Map<String, Object>>) message.getMessageProperties().getHeaders().get("x-death");
+
+            if (xDeathHeader != null && !xDeathHeader.isEmpty()) {
+                Map<String, Object> death = xDeathHeader.get(0);
+                Object countObj = death.get("count");
+
+                if (countObj instanceof Long) {
+                    long count = (Long) countObj;
+                    // count가 maxAttempts-1이면 마지막 시도 (0부터 시작)
+                    boolean isFinal = count >= (maxAttempts - 1);
+                    log.debug("x-death count: {}, maxAttempts: {}, isFinal: {}", count, maxAttempts, isFinal);
+                    return isFinal;
+                } else if (countObj instanceof Integer) {
+                    int count = (Integer) countObj;
+                    boolean isFinal = count >= (maxAttempts - 1);
+                    log.debug("x-death count: {}, maxAttempts: {}, isFinal: {}", count, maxAttempts, isFinal);
+                    return isFinal;
+                }
+            }
+
+            // x-death가 없으면 첫 시도
+            log.debug("No x-death header found - first attempt");
+            return false;
+
+        } catch (Exception e) {
+            log.warn("Failed to check if final attempt: {}", e.getMessage());
+            // 확인 실패 시 안전하게 false 반환 (첫 시도로 간주)
+            return false;
         }
     }
 

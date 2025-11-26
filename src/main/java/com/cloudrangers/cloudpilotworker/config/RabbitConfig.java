@@ -1,9 +1,13 @@
 package com.cloudrangers.cloudpilotworker.config;
 
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.type.TypeFactory;
 import org.springframework.amqp.core.*;
 import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
+import org.springframework.amqp.support.converter.DefaultJackson2JavaTypeMapper;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -11,6 +15,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.amqp.SimpleRabbitListenerContainerFactoryConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.handler.annotation.support.DefaultMessageHandlerMethodFactory;
+import org.springframework.messaging.handler.annotation.support.MessageHandlerMethodFactory;
 
 @Configuration
 public class RabbitConfig {
@@ -23,9 +29,9 @@ public class RabbitConfig {
     @Value("${rabbitmq.queue.provision.name}")    private String provisionQueueName;
     @Value("${rabbitmq.queue.result.name}")       private String resultQueueName;
 
-    @Value("${rabbitmq.routing-key.provision}")   private String provisionRoutingKey;   // e.g. "provision.#"
-    @Value("${rabbitmq.routing-key.result}")      private String resultRoutingKey;      // e.g. "result.provision.#"
-    @Value("${rabbitmq.routing-key.dlq}")         private String dlqRoutingKey;         // e.g. "provision.dlq"
+    @Value("${rabbitmq.routing-key.provision}")   private String provisionRoutingKey;
+    @Value("${rabbitmq.routing-key.result}")      private String resultRoutingKey;
+    @Value("${rabbitmq.routing-key.dlq}")         private String dlqRoutingKey;
 
     // ===== Exchange =====
     @Bean("provisionExchange")
@@ -39,12 +45,11 @@ public class RabbitConfig {
     }
 
     // ===== Queue =====
-    // 현재 브로커의 provision-jobs 큐에는 DLX 인자가 있으므로, 워커도 동일하게 선언
     @Bean("provisionQueue")
     public Queue provisionQueue() {
         return QueueBuilder.durable(provisionQueueName)
                 .withArgument("x-dead-letter-exchange", dlxExchangeName)
-                .withArgument("x-dead-letter-routing-key", dlqRoutingKey)  // "provision.dlq"
+                .withArgument("x-dead-letter-routing-key", dlqRoutingKey)
                 .build();
     }
 
@@ -54,7 +59,6 @@ public class RabbitConfig {
     }
 
     // ===== Binding =====
-    // 파라미터 주입 방식으로 동일 빈을 안전하게 참조
     @Bean
     public Binding provisionBinding(
             @Qualifier("provisionQueue") Queue queue,
@@ -69,24 +73,50 @@ public class RabbitConfig {
         return BindingBuilder.bind(queue).to(exchange).with(resultRoutingKey);
     }
 
-    // ===== Converter =====
+    // ===== Converter (⭐️ TypeId 완전히 무시) =====
     @Bean
-    public MessageConverter messageConverter() {
-        return new Jackson2JsonMessageConverter();
+    public MessageConverter messageConverter(ObjectMapper objectMapper) {
+        Jackson2JsonMessageConverter converter = new Jackson2JsonMessageConverter(objectMapper);
+
+        // ⭐️ 커스텀 TypeMapper: __TypeId__ 헤더를 완전히 무시
+        DefaultJackson2JavaTypeMapper typeMapper = new DefaultJackson2JavaTypeMapper() {
+            @Override
+            public JavaType toJavaType(org.springframework.amqp.core.MessageProperties properties) {
+                // __TypeId__ 헤더를 무시하고 기본 타입(Object) 반환
+                return TypeFactory.defaultInstance().constructType(Object.class);
+            }
+        };
+
+        converter.setJavaTypeMapper(typeMapper);
+        return converter;
+    }
+
+    // ===== Message Handler Method Factory (⭐️ 변환 비활성화) =====
+    @Bean
+    public MessageHandlerMethodFactory messageHandlerMethodFactory() {
+        DefaultMessageHandlerMethodFactory factory = new DefaultMessageHandlerMethodFactory();
+        // 메시지 변환을 건너뛰고 원시 Message를 전달
+        return factory;
     }
 
     // ===== Listener Factory =====
     @Bean
     public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
             SimpleRabbitListenerContainerFactoryConfigurer configurer,
-            ConnectionFactory connectionFactory
+            ConnectionFactory connectionFactory,
+            MessageConverter messageConverter
     ) {
         SimpleRabbitListenerContainerFactory f = new SimpleRabbitListenerContainerFactory();
         configurer.configure(f, connectionFactory);
+
+        // ⭐️ 커스텀 MessageConverter 설정
+        f.setMessageConverter(messageConverter);
+
         // 실패 시 재큐잉 금지 → DLX로 바로 이동
         f.setDefaultRequeueRejected(false);
         // 큐가 잠시 없어도 기동
         f.setMissingQueuesFatal(false);
+
         return f;
     }
 
@@ -94,7 +124,7 @@ public class RabbitConfig {
     @Bean
     public RabbitAdmin rabbitAdmin(ConnectionFactory cf) {
         RabbitAdmin admin = new RabbitAdmin(cf);
-        admin.setAutoStartup(true); // 브로커에 동일 자원이 없으면 이 설정으로 선언됨
+        admin.setAutoStartup(true);
         return admin;
     }
 }
