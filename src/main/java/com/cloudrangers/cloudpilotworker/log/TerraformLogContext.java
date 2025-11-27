@@ -24,7 +24,13 @@ public class TerraformLogContext {
     // 에러 추적용
     private boolean inError;
     private String errorStartLine;
-    private TerraformErrorType errorType;
+
+    /**
+     * ❗ 기본값을 UNKNOWN으로 설정해서
+     *    getErrorType()이 절대 null을 반환하지 않도록 함
+     */
+    private TerraformErrorType errorType = TerraformErrorType.UNKNOWN;
+
     private int emptyLines;
     private int stackLines;
     private String failedResource;
@@ -53,6 +59,19 @@ public class TerraformLogContext {
 
     public boolean hasRelatedConfig() {
         return !relatedConfig.isEmpty();
+    }
+
+    /**
+     * ❗ Lombok @Data가 getter/setter를 만들어주지만,
+     *    우리가 직접 정의하면 이 메서드들이 우선 사용됨.
+     *    -> 항상 null 대신 UNKNOWN을 반환/설정하도록 강제.
+     */
+    public TerraformErrorType getErrorType() {
+        return errorType != null ? errorType : TerraformErrorType.UNKNOWN;
+    }
+
+    public void setErrorType(TerraformErrorType errorType) {
+        this.errorType = (errorType != null) ? errorType : TerraformErrorType.UNKNOWN;
     }
 
     public void update(String line) {

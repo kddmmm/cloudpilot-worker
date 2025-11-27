@@ -12,6 +12,7 @@ public class ProvisionJobMessage {
 
     // 기본 필드
     private String jobId;
+    private String action;
     private Object providerType;
     private Long zoneId;
 

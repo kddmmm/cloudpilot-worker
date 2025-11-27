@@ -263,6 +263,12 @@ public class TerraformLogRefiner {
     private String buildErrorSummary(TerraformLogContext context) {
         StringBuilder summary = new StringBuilder();
 
+        // 🔒 null-safe 처리
+        TerraformErrorType type = null;
+        if (context != null) {
+            type = context.getErrorType();
+        }
+
         summary.append("\n📊 Error Analysis:\n");
         summary.append(String.format("  • Type: %s\n", context.getErrorType().getDisplayName()));
         summary.append(String.format("  • Stage: %s\n", context.getCurrentStage()));
