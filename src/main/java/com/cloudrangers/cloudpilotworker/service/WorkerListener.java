@@ -18,7 +18,6 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Service;
 
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -59,16 +58,13 @@ public class WorkerListener {
 
         log.info("[Worker:{}] Message received. isFinalAttempt={}", workerId, isFinalAttempt);
 
-        // ✅ message 전체를 넘김 (byte[] 추출 삭제)
         ProvisionJobMessage msg = null;
 
         try {
-            msg = coerceToProvisionJobMessage(message);  // ✅ message 전체 전달
+            msg = coerceToProvisionJobMessage(message);
 
             final String jobId   = msg.getJobId();
             final String corrIn  = toCorrString(correlationIdRaw) != null ? toCorrString(correlationIdRaw) : jobId;
-            final String corrOut = jobId;
-            final String jobIdHeader = jobId;
 
             log.info("[Worker:{}] ===== Received Provision Job =====", workerId);
             log.info("[Worker:{}] JobID: {}, CorrelationID: {}, isFinalAttempt: {}", workerId, jobId, corrIn, isFinalAttempt);
@@ -80,7 +76,7 @@ public class WorkerListener {
             }
 
             // ============================================================
-            // 1. Terraform 실행 (VM 생성) - ⭐️ isFinalAttempt 전달
+            // 1. Terraform 실행 (VM 생성) - ✅ SUCCESS 이벤트는 여기서 자동 전송됨
             // ============================================================
             String vmId = terraformExecutor.execute(msg, isFinalAttempt);
             log.info("[Worker:{}] Terraform execution finished. VM ID: {}", workerId, vmId);
@@ -92,7 +88,7 @@ public class WorkerListener {
             log.info("[Worker:{}] Final selected IP from Terraform: {}", workerId, extractedIp);
 
             // ============================================================
-            // 3. Ansible 실행 - ⭐️ isFinalAttempt 전달
+            // 3. Ansible 실행
             // ============================================================
             String targetIp = extractedIp;
 
@@ -102,59 +98,18 @@ public class WorkerListener {
                     ansibleExecutor.execute(targetIp, msg, isFinalAttempt);
                     log.info("[Worker:{}] Ansible provisioning completed successfully.", workerId);
 
+                    // ✅ Ansible 완료 알림 (LOG 이벤트로 전송)
+                    sendAnsibleCompletedEvent(jobId, targetIp);
+
                 } catch (Exception e) {
                     log.error("[Worker:{}] ⚠️ Ansible failed, but VM created. Error: {}", workerId, e.getMessage());
+                    // Ansible 실패는 무시 (VM은 이미 생성됨)
                 }
             } else {
                 log.warn("[Worker:{}] ⚠️ Skipping Ansible: No valid IP address found in Terraform output.", workerId);
             }
 
-            // ============================================================
-            // 4. 결과 전송 (SUCCESS)
-            // ============================================================
-            ProvisionResultMessage result = new ProvisionResultMessage();
-            result.setJobId(jobId);
-            result.setEventType(ProvisionResultMessage.EventType.SUCCESS);
-            result.setStatus("SUCCEEDED");
-            result.setVmId(vmId);
-            result.setMessage("VM created and configured successfully");
-            result.setTimestamp(OffsetDateTime.now());
-
-            List<ProvisionResultMessage.InstanceInfo> instances = new ArrayList<>();
-            int vmCount = (msg.getVmCount() != null && msg.getVmCount() > 0) ? msg.getVmCount() : 1;
-
-            for (int i = 0; i < vmCount; i++) {
-                ProvisionResultMessage.InstanceInfo inst = new ProvisionResultMessage.InstanceInfo();
-
-                String baseName = msg.getVmName();
-                String name = (vmCount == 1) ? baseName : baseName + "-" + (i + 1);
-                inst.setName(name);
-                inst.setExternalId((vmCount == 1) ? vmId : vmId + "#" + (i + 1));
-
-                if (msg.getZoneId() != null) inst.setZoneId(msg.getZoneId());
-                if (msg.getProviderType() != null) inst.setProviderType(String.valueOf(msg.getProviderType()));
-                inst.setCpuCores(msg.getCpuCores());
-                inst.setMemoryGb(msg.getMemoryGb());
-                inst.setDiskGb(msg.getDiskGb());
-
-                inst.setIpAddress(targetIp);
-
-                if (msg.getOs() != null && msg.getOs().getFamily() != null) {
-                    inst.setOsType(msg.getOs().getFamily());
-                } else if (msg.getTemplate() != null && msg.getTemplate().getGuestId() != null) {
-                    inst.setOsType(msg.getTemplate().getGuestId());
-                }
-
-                instances.add(inst);
-            }
-            result.setInstances(instances);
-
-            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
-                m.getMessageProperties().setCorrelationId(corrOut);
-                m.getMessageProperties().setHeader("jobId", jobIdHeader);
-                return m;
-            });
-
+            // ✅ SUCCESS는 TerraformExecutor에서 이미 전송했으므로 여기서는 전송하지 않음
             log.info("[Worker:{}] ✓ Job completed. jobId={}, IP={}", workerId, jobId, targetIp);
 
         } catch (Exception e) {
@@ -178,6 +133,33 @@ public class WorkerListener {
             });
 
             throw new AmqpRejectAndDontRequeueException("Listener failed", e);
+        }
+    }
+
+    /**
+     * ✅ Ansible 완료 알림 (LOG 이벤트)
+     * - VM 생성은 Terraform에서 이미 완료되었으므로
+     * - Ansible 완료는 LOG 이벤트로만 기록
+     */
+    private void sendAnsibleCompletedEvent(String jobId, String targetIp) {
+        try {
+            ProvisionResultMessage result = new ProvisionResultMessage();
+            result.setJobId(jobId);
+            result.setEventType(ProvisionResultMessage.EventType.LOG);
+            result.setStatus("LOG");
+            result.setStep("ansible_provision");
+            result.setMessage("Ansible provisioning completed for IP: " + targetIp);
+            result.setTimestamp(OffsetDateTime.now());
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+
+            log.info("[Worker:{}] Sent Ansible completion LOG event for jobId={}", workerId, jobId);
+        } catch (Exception e) {
+            log.warn("[Worker:{}] Failed to send Ansible completion event: {}", workerId, e.getMessage());
         }
     }
 
