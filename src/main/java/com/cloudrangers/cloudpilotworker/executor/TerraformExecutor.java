@@ -114,27 +114,20 @@ public class TerraformExecutor {
             String vmName = nvl(msg.getVmName(), "vm-" + jobId);
             String action = resolveAction(msg);
 
-            // 작업 디렉토리 결정 (destroy 시 stateUri 기반 재사용 시도)
-            File workDir;
+            log.info("[TerraformExecutor] action={}, jobId={}, vmName={}, stateUriFromBackend={}",
+                    action, jobIdStr, vmName, stateUriFromBackend);
+
+            // 작업 디렉토리: 항상 /tmp/terraform/{jobId}
+            File workDir = new File("/tmp/terraform/" + jobIdStr);
+            if (!workDir.exists() && !workDir.mkdirs()) {
+                throw new RuntimeException("Failed to create workDir: " + workDir.getAbsolutePath());
+            }
+
+            // destroy인 경우 기존 state 재사용 시도
             if ("destroy".equalsIgnoreCase(action)
                     && stateUriFromBackend != null
                     && !stateUriFromBackend.isBlank()) {
-
-                File stateFile = new File(stateUriFromBackend);
-                workDir = stateFile.getParentFile();
-
-                if (workDir == null || !workDir.exists()) {
-                    log.warn("State directory not found: {}, creating new directory", stateUriFromBackend);
-                    workDir = new File("/tmp/terraform/" + jobIdStr);
-                } else {
-                    log.info("Reusing existing directory for destroy: {}", workDir.getAbsolutePath());
-                }
-            } else {
-                workDir = new File("/tmp/terraform/" + jobIdStr);
-            }
-
-            if (!workDir.exists() && !workDir.mkdirs()) {
-                throw new RuntimeException("Failed to create workDir: " + workDir.getAbsolutePath());
+                prepareStateForDestroy(workDir, stateUriFromBackend);
             }
 
             Map<String, Object> tfVars = buildTfVarsFromMessage(msg, vmName);
@@ -160,7 +153,7 @@ public class TerraformExecutor {
                 return vmName;
             } catch (RuntimeException e) {
                 // 실패 시 ERROR 이벤트 전송
-                sendErrorEvent(jobIdStr, e, tfRunId);
+                sendErrorEvent(jobIdStr, msg, e, tfRunId);
                 throw e;
             }
         } finally {
@@ -501,6 +494,46 @@ public class TerraformExecutor {
     // Terraform 실행 시퀀스 + 커맨드
     // ============================================================
 
+    /**
+     * destroy 시 기존 state 파일을 작업 디렉토리로 복사
+     */
+    private void prepareStateForDestroy(File workDir, String stateUri) {
+        if (stateUri == null || stateUri.isBlank()) {
+            log.info("[TerraformExecutor] No stateUri provided; destroy will run with empty state.");
+            return;
+        }
+
+        try {
+            Path srcPath = Paths.get(stateUri);
+
+            // stateUri가 디렉터리인 경우 내부의 terraform.tfstate 사용
+            if (Files.isDirectory(srcPath)) {
+                Path tfState = srcPath.resolve("terraform.tfstate");
+                if (Files.exists(tfState)) {
+                    srcPath = tfState;
+                } else {
+                    log.warn("[TerraformExecutor] stateUri is directory but terraform.tfstate not found: {}", tfState);
+                    return;
+                }
+            }
+
+            if (!Files.exists(srcPath)) {
+                log.warn("[TerraformExecutor] state file does not exist: {}", srcPath);
+                return;
+            }
+
+            Files.createDirectories(workDir.toPath());
+            Path destPath = workDir.toPath().resolve("terraform.tfstate");
+
+            Files.copy(srcPath, destPath, StandardCopyOption.REPLACE_EXISTING);
+
+            log.info("[TerraformExecutor] Prepared state file for destroy: {} -> {}",
+                    srcPath, destPath);
+        } catch (Exception e) {
+            log.error("[TerraformExecutor] Failed to prepare state for destroy. stateUri={}", stateUri, e);
+        }
+    }
+
     private void runTerraformSequence(File dir, Map<String, String> env, String action) {
         executeCommand(dir, env, "terraform", "init", "-input=false", "-no-color");
         executeCommand(dir, env, "terraform", "validate", "-no-color");
@@ -789,6 +822,12 @@ public class TerraformExecutor {
             result.setTfRunId(tfRunId);
             result.setMessage("Terraform destroy succeeded");
 
+            // 원본 요청 메시지에서 vmId 전달 (BE에서 vm_instance 삭제 처리에 사용)
+            String vmIdStr = extractVmIdFromMsg(msg);
+            if (isNotBlank(vmIdStr)) {
+                result.setVmId(vmIdStr);
+            }
+
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
                 m.getMessageProperties().setCorrelationId(jobId);
                 m.getMessageProperties().setHeader("jobId", jobId);
@@ -798,7 +837,8 @@ public class TerraformExecutor {
                 return m;
             });
 
-            log.info("[TerraformExecutor] Sent DESTROY SUCCESS event for jobId={}, tfRunId={}", jobId, tfRunId);
+            log.info("[TerraformExecutor] Sent DESTROY SUCCESS event for jobId={}, tfRunId={}, vmId={}",
+                    jobId, tfRunId, vmIdStr);
         } catch (Exception e) {
             log.warn("[TerraformExecutor] Failed to send DESTROY SUCCESS event: {}", e.getMessage());
         }
@@ -807,7 +847,10 @@ public class TerraformExecutor {
     /**
      * Terraform 실행 과정에서 예외 발생 시 ERROR 이벤트 전송
      */
-    private void sendErrorEvent(String jobId, RuntimeException e, Long tfRunId) {
+    private void sendErrorEvent(String jobId,
+                                ProvisionJobMessage srcMsg,
+                                RuntimeException e,
+                                Long tfRunId) {
         if (jobId == null) return;
 
         try {
@@ -820,6 +863,12 @@ public class TerraformExecutor {
             result.setMessage(firstLine(e.getMessage()));
             result.setTfRunId(tfRunId);
 
+            // destroy 실패 시에도 vmId를 같이 보내서 BE에서 lifecycle 롤백 가능하게
+            String vmIdStr = extractVmIdFromMsg(srcMsg);
+            if (isNotBlank(vmIdStr)) {
+                result.setVmId(vmIdStr);
+            }
+
             rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, result, m -> {
                 m.getMessageProperties().setCorrelationId(jobId);
                 m.getMessageProperties().setHeader("jobId", jobId);
@@ -829,8 +878,8 @@ public class TerraformExecutor {
                 return m;
             });
 
-            log.warn("[TerraformExecutor] Sent ERROR event for jobId={}, tfRunId={}: {}",
-                    jobId, tfRunId, firstLine(e.getMessage()));
+            log.warn("[TerraformExecutor] Sent ERROR event for jobId={}, tfRunId={}, vmId={}: {}",
+                    jobId, tfRunId, vmIdStr, firstLine(e.getMessage()));
         } catch (Exception ex) {
             log.warn("[TerraformExecutor] Failed to send ERROR event for jobId={}: {}", jobId, ex.getMessage());
         }
@@ -990,7 +1039,6 @@ public class TerraformExecutor {
             Object datacenterObj = msg.getAdditionalConfig() != null
                     ? msg.getAdditionalConfig().getOrDefault("datacenter", null)
                     : null;
-            if (datacenterObj == null) datacenterObj = msg.getZoneId(); // 필요 시 조정
 
             tf.put("datacenter", nvl(
                     datacenterObj != null ? String.valueOf(datacenterObj) : null,
@@ -1711,5 +1759,16 @@ public class TerraformExecutor {
 
         String stateUri = String.valueOf(stateUriObj).trim();
         return stateUri.isEmpty() || "null".equalsIgnoreCase(stateUri) ? null : stateUri;
+    }
+
+    /**
+     * 원본 ProvisionJobMessage.additionalConfig 에서 vmId 추출
+     */
+    private String extractVmIdFromMsg(ProvisionJobMessage msg) {
+        if (msg == null) return null;
+        Map<String, Object> add = msg.getAdditionalConfig();
+        if (add == null) return null;
+        Object vmIdObj = add.get("vmId");
+        return vmIdObj != null ? String.valueOf(vmIdObj) : null;
     }
 }
