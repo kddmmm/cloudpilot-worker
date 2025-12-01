@@ -1331,7 +1331,7 @@ public class TerraformExecutor {
         info.setMemoryGb(mem);
         info.setDiskGb(disk);
 
-        // OS 타입
+        // OS 타입 (os_image.code 우선)
         info.setOsType(resolveOsType(msg));
 
         // IP / NIC 주소
@@ -1394,6 +1394,7 @@ public class TerraformExecutor {
         info.setMemoryGb(mem);
         info.setDiskGb(disk);
 
+        // OS 타입 (os_image.code 우선)
         info.setOsType(resolveOsType(msg));
 
         // IP / NIC
@@ -1461,8 +1462,29 @@ public class TerraformExecutor {
         return String.join(",", nic);
     }
 
+    /**
+     * osType 결정 로직
+     * - 1순위: additionalConfig.os_image_code (BE에서 세팅한 os_image.code)
+     * - 2순위: family + version + variant 문자열 (기존 방식)
+     */
     private String resolveOsType(ProvisionJobMessage msg) {
-        if (msg == null || msg.getOs() == null) return null;
+        if (msg == null) return null;
+
+        // 1) os_image_code 우선
+        Map<String, Object> add = msg.getAdditionalConfig();
+        if (add != null) {
+            Object codeObj = add.get("os_image_code");
+            if (codeObj != null) {
+                String code = String.valueOf(codeObj).trim();
+                if (!code.isEmpty()) {
+                    // 예: ubuntu-22.04-minimal-x86_64 또는 rocky
+                    return code;
+                }
+            }
+        }
+
+        // 2) fallback: family + version + variant
+        if (msg.getOs() == null) return null;
         ProvisionJobMessage.OsSpec os = msg.getOs();
         StringBuilder sb = new StringBuilder();
         if (isNotBlank(os.getFamily())) sb.append(os.getFamily());
