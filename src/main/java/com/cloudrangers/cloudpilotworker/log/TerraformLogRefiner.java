@@ -89,8 +89,8 @@ public class TerraformLogRefiner {
     private boolean shouldSkip(String line, TerraformLogContext context) {
         if (line.isEmpty()) return true;
 
-        // Still creating 반복
-        if ((line.contains("Still creating") || line.contains("Still destroying"))
+        // Still destroying 반복 (생성은 10초 단위로 모두 노출, 삭제는 그대로 스킵)
+        if (line.contains("Still destroying")
                 && !context.isFirstStillCreating() && !context.isLongRunning()) {
             return true;
         }
@@ -173,17 +173,15 @@ public class TerraformLogRefiner {
             return "✓ Terraform Initialized";
         }
 
-        // Still creating (요약)
+        // Still creating (10초 단위로 모두 출력)
         if (line.contains("Still creating")) {
             String elapsed = extractElapsed(line);
             if (context.isFirstStillCreating()) {
                 context.setFirstStillCreating(false);
                 return String.format("  ... Creating (elapsed: %s)", elapsed);
             }
-            if (isSignificantInterval(elapsed)) {
-                return String.format("  ... Still creating (%s)", elapsed);
-            }
-            return null;
+            // 이후에는 매번 10초마다 들어오는 로그를 그대로 노출
+            return String.format("  ... Still creating (%s)", elapsed);
         }
 
         // 중요 메시지만 통과
@@ -263,7 +261,7 @@ public class TerraformLogRefiner {
     private String buildErrorSummary(TerraformLogContext context) {
         StringBuilder summary = new StringBuilder();
 
-        // 🔒 null-safe 처리
+        // 🔒 null-safe 처리 (추가 방어는 필요하면 여기서 해도 됨)
         TerraformErrorType type = null;
         if (context != null) {
             type = context.getErrorType();
@@ -292,10 +290,6 @@ public class TerraformLogRefiner {
     }
 
     // ===== 유틸리티 메서드 =====
-
-    private boolean isSignificantInterval(String elapsed) {
-        return elapsed.matches("0\\dm00s") || elapsed.matches("0\\dm30s");
-    }
 
     private boolean isCriticalMessage(String line) {
         return line.contains("complete") ||
