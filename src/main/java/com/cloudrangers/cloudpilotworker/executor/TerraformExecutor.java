@@ -611,13 +611,19 @@ public class TerraformExecutor {
                         // 3) 콘솔 로그는 원본 그대로 (원하면 여기도 줄일 수 있음)
                         log.info("[terraform] {}", line);
 
-                        // 4) 정제된 라인만 큐로 전송
+                        // 4) 정제된 라인만 큐로 전송 (에러 상태면 ERROR 이벤트로)
                         if (refinedLine != null) {
                             if (refinedBuffer != null) {
                                 refinedBuffer.append(refinedLine).append('\n');
                             }
-                            log.info("[terraform-refined] {}", refinedLine);
-                            sendLogEvent(jobId, step, refinedLine);  // 🔥 여기만 보냄
+
+                            if (ctx != null && ctx.isInError()) {
+                                log.error("[terraform-refined-error] {}", refinedLine);
+                                sendErrorLogEvent(jobId, step, refinedLine);
+                            } else {
+                                log.info("[terraform-refined] {}", refinedLine);
+                                sendLogEvent(jobId, step, refinedLine);
+                            }
                         }
                     }
                 } catch (IOException ignore) {
@@ -649,13 +655,13 @@ public class TerraformExecutor {
                         // 3) 콘솔 로그는 원본 그대로
                         log.error("[terraform] {}", line);
 
-                        // 4) 정제된 라인만 큐로 전송
+                        // 4) 정제된 라인만 큐로 전송 (stderr는 항상 ERROR 이벤트로)
                         if (refinedLine != null) {
                             if (refinedBuffer != null) {
                                 refinedBuffer.append(refinedLine).append('\n');
                             }
                             log.error("[terraform-refined-error] {}", refinedLine);
-                            sendLogEvent(jobId, step, refinedLine);
+                            sendErrorLogEvent(jobId, step, refinedLine);
                         }
                     }
                 } catch (IOException ignore) {
@@ -672,7 +678,7 @@ public class TerraformExecutor {
             if (!finished) {
                 p.destroyForcibly();
                 String msg = "Command timed out: " + display;
-                sendLogEvent(jobId, step, msg);
+                sendErrorLogEvent(jobId, step, msg);
                 throw new RuntimeException(msg);
             }
 
@@ -682,17 +688,17 @@ public class TerraformExecutor {
             if (exit != 0) {
                 String merged = mergeOutErr(stdoutBuf.toString(), stderrBuf.toString());
                 String msg = "Command failed: " + display + " (exit " + exit + ")\n" + merged;
-                sendLogEvent(jobId, step, firstLine(msg));
+                sendErrorLogEvent(jobId, step, firstLine(msg));
                 throw wrapTerraformException(new RuntimeException(msg));
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             String msg = "Command interrupted: " + display + " - " + ie.getMessage();
-            sendLogEvent(jobId, step, firstLine(msg));
+            sendErrorLogEvent(jobId, step, firstLine(msg));
             throw wrapTerraformException(new RuntimeException(msg, ie));
         } catch (IOException e) {
             String msg = "Command failed to start/run: " + display + " - " + e.getMessage();
-            sendLogEvent(jobId, step, firstLine(msg));
+            sendErrorLogEvent(jobId, step, firstLine(msg));
             throw wrapTerraformException(new RuntimeException(msg, e));
         }
     }
@@ -728,6 +734,31 @@ public class TerraformExecutor {
             });
         } catch (Exception e) {
             log.warn("[TerraformExecutor] Failed to send LOG event for jobId={}: {}", jobId, e.getMessage());
+        }
+    }
+
+    /**
+     * 실패 시 ERROR 이벤트 전송 (LOG 대신 ERROR 타입 사용)
+     */
+    private void sendErrorLogEvent(String jobId, String step, String line) {
+        if (jobId == null) return;
+
+        try {
+            ProvisionResultMessage msg = new ProvisionResultMessage();
+            msg.setJobId(jobId);
+            msg.setEventType(ProvisionResultMessage.EventType.ERROR);
+            msg.setStatus("FAILED");
+            msg.setStep(step);
+            msg.setMessage(line);
+            msg.setTimestamp(OffsetDateTime.now());
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, msg, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+        } catch (Exception e) {
+            log.warn("[TerraformExecutor] Failed to send ERROR event for jobId={}: {}", jobId, e.getMessage());
         }
     }
 

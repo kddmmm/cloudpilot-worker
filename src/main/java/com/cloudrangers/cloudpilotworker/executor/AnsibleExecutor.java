@@ -1,16 +1,20 @@
 package com.cloudrangers.cloudpilotworker.executor;
 
 import com.cloudrangers.cloudpilotworker.dto.ProvisionJobMessage;
+import com.cloudrangers.cloudpilotworker.dto.ProvisionResultMessage;
 import com.cloudrangers.cloudpilotworker.log.AnsibleLogContext;
 import com.cloudrangers.cloudpilotworker.log.AnsibleLogRefiner;
 import com.cloudrangers.cloudpilotworker.log.LogStorageService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -24,29 +28,35 @@ public class AnsibleExecutor {
     private final ObjectMapper objectMapper;
     private final AnsibleLogRefiner logRefiner;
     private final LogStorageService logStorageService;
+    private final RabbitTemplate rabbitTemplate;  // ⭐ 추가
 
-    // ⭐️ Ansible 서버(Worker Node)의 실제 경로 설정
+    @Value("${rabbitmq.exchange.result.name}")
+    private String resultExchange;
+
+    @Value("${rabbitmq.routing-key.result}")
+    private String resultRoutingKey;
+
     private static final String ANSIBLE_PLAYBOOK_PATH = "/etc/ansible/main_provision.yml";
     private static final String SSH_KEY_PATH = "/home/admin/.ssh/ansible_key";
     private static final String REMOTE_USER = "admin";
 
     public AnsibleExecutor(ObjectMapper objectMapper,
                            AnsibleLogRefiner logRefiner,
-                           LogStorageService logStorageService) {
+                           LogStorageService logStorageService,
+                           RabbitTemplate rabbitTemplate) {  // ⭐ 추가
         this.objectMapper = objectMapper;
         this.logRefiner = logRefiner;
         this.logStorageService = logStorageService;
+        this.rabbitTemplate = rabbitTemplate;
     }
 
-    public void execute(String targetIp, ProvisionJobMessage msg, boolean isFinalAttempt) {  // ⭐️ 파라미터 추가
+    public void execute(String targetIp, ProvisionJobMessage msg, boolean isFinalAttempt) {
         log.info("🚀 [Ansible] Starting Provisioning for IP: {}", targetIp);
 
-        // 로그 정제를 위한 버퍼 및 컨텍스트 초기화
         StringBuilder refinedLog = new StringBuilder();
         StringBuilder rawLog = new StringBuilder();
         AnsibleLogContext context = new AnsibleLogContext();
 
-        // JobId 추출 (로그 저장용)
         String jobId = msg.getJobId() != null ? String.valueOf(msg.getJobId()) :
                 String.valueOf(System.currentTimeMillis());
 
@@ -84,20 +94,32 @@ public class AnsibleExecutor {
 
             Process process = pb.start();
 
-            // 5. 로그 실시간 출력 및 정제
+            // 5. 로그 실시간 출력 및 RabbitMQ 전송
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
+                    // 원본 로그는 파일용 버퍼에 저장
                     rawLog.append(line).append('\n');
 
+                    // 로그 정제
                     String refinedLine = logRefiner.refineLine(line, context);
+
+                    // 콘솔 출력
+                    log.info("[Ansible-Log] {}", line);
+
+                    // ⭐ 정제된 로그만 RabbitMQ로 전송
                     if (refinedLine != null) {
                         refinedLog.append(refinedLine).append('\n');
                         log.info("[Ansible-refined] {}", refinedLine);
-                    }
 
-                    log.info("[Ansible-Log] {}", line);
+                        // RabbitMQ로 LOG 이벤트 전송
+                        if (context.isInError()) {
+                            sendErrorLogEvent(jobId, "ansible_provision", refinedLine);
+                        } else {
+                            sendLogEvent(jobId, "ansible_provision", refinedLine);
+                        }
+                    }
                 }
             }
 
@@ -105,27 +127,91 @@ public class AnsibleExecutor {
             boolean finished = process.waitFor(20, TimeUnit.MINUTES);
             if (!finished) {
                 process.destroyForcibly();
-                throw new RuntimeException("Ansible execution timed out.");
+                String timeoutMsg = "Ansible execution timed out.";
+                sendErrorLogEvent(jobId, "ansible_provision", timeoutMsg);
+                throw new RuntimeException(timeoutMsg);
             }
 
             int exitCode = process.exitValue();
             if (exitCode != 0) {
-                throw new RuntimeException("Ansible execution failed with exit code: " + exitCode);
+                String errorMsg = "Ansible execution failed with exit code: " + exitCode;
+                sendErrorLogEvent(jobId, "ansible_provision", errorMsg);
+                throw new RuntimeException(errorMsg);
             }
 
-            log.info("✅ [Ansible] Provisioning Completed Successfully for IP: {}", targetIp);
+            // ⭐ 최종 완료 로그 전송
+            String completionMsg = "✅ [Ansible] Provisioning Completed Successfully for IP: " + targetIp;
+            sendLogEvent(jobId, "ansible_provision", completionMsg);
+            log.info(completionMsg);
 
         } catch (Exception e) {
             log.error("❌ [Ansible] Execution Error", e);
+            sendErrorLogEvent(jobId, "ansible_provision",
+                    "Ansible Execution Failed: " + e.getMessage());
             throw new RuntimeException("Ansible Execution Failed", e);
         } finally {
-            // ⭐️ 마지막 시도일 때만 refined 로그 저장
             try {
                 logStorageService.saveLogsToLocal(jobId, "ansible-provision",
                         refinedLog.toString(), rawLog.toString(), isFinalAttempt);
             } catch (Exception e) {
                 log.error("Failed to save Ansible logs to local filesystem for jobId: {}", jobId, e);
             }
+        }
+    }
+
+    // ⭐ LOG 이벤트 전송 메서드 추가
+    private void sendLogEvent(String jobId, String step, String line) {
+        if (jobId == null) return;
+
+        try {
+            ProvisionResultMessage msg = new ProvisionResultMessage();
+            msg.setJobId(jobId);
+            msg.setEventType(ProvisionResultMessage.EventType.LOG);
+            msg.setStatus("LOG");
+            msg.setStep(step);
+            msg.setMessage(line);
+            msg.setTimestamp(OffsetDateTime.now());
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, msg, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+
+            log.debug("📤 Sent Ansible LOG event: jobId={}, line={}", jobId,
+                    line.length() > 100 ? line.substring(0, 100) + "..." : line);
+
+        } catch (Exception e) {
+            log.warn("[AnsibleExecutor] Failed to send LOG event for jobId={}: {}",
+                    jobId, e.getMessage());
+        }
+    }
+
+    // ⭐ ERROR 이벤트 전송 메서드 추가
+    private void sendErrorLogEvent(String jobId, String step, String line) {
+        if (jobId == null) return;
+
+        try {
+            ProvisionResultMessage msg = new ProvisionResultMessage();
+            msg.setJobId(jobId);
+            msg.setEventType(ProvisionResultMessage.EventType.ERROR);
+            msg.setStatus("FAILED");
+            msg.setStep(step);
+            msg.setMessage(line);
+            msg.setTimestamp(OffsetDateTime.now());
+
+            rabbitTemplate.convertAndSend(resultExchange, resultRoutingKey, msg, m -> {
+                m.getMessageProperties().setCorrelationId(jobId);
+                m.getMessageProperties().setHeader("jobId", jobId);
+                return m;
+            });
+
+            log.error("📤 Sent Ansible ERROR event: jobId={}, error={}", jobId,
+                    line.length() > 100 ? line.substring(0, 100) + "..." : line);
+
+        } catch (Exception e) {
+            log.warn("[AnsibleExecutor] Failed to send ERROR event for jobId={}: {}",
+                    jobId, e.getMessage());
         }
     }
 }
